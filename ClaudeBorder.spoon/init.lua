@@ -54,11 +54,17 @@ obj.colors = {
   cyan   = "#64d2ff", blue   = "#0a84ff", purple = "#bf5af0", pink   = "#ff375f",
 }
 
+--- ClaudeBorder.unknownColor (String)
+--- Used when a session's /color cannot be determined. Deliberately NOT one of
+--- the eight: a fallback that looks like a valid choice turns "no colour found"
+--- into "wrong colour shown".
+obj.unknownColor = "#8e8e93"
+
 --------------------------------------------------------------------------------
 -- Internal state
 --------------------------------------------------------------------------------
 
-local painted   = {}      -- [tty] = { canvas, color, mode, timer, win, title }
+local painted   = {}      -- [tty] = { canvas, color, mode, timer, win, title, transcript, watcher }
 local shown     = true
 local reflowing = false
 local wf, appWatcher
@@ -150,19 +156,63 @@ local function startBlink(rec)
 end
 
 --------------------------------------------------------------------------------
+-- Live /color tracking
+--
+-- /color is a built-in command that fires no Claude Code hook, so a hook-driven
+-- repaint only happens on the next submitted prompt. Watching the session
+-- transcript closes that gap: the colour lands within a second of the command.
+--------------------------------------------------------------------------------
+
+-- Read only the tail: transcripts reach many megabytes and are appended to
+-- constantly during a turn.
+local function lastColorIn(path)
+  local f = io.open(path, "rb")
+  if not f then return nil end
+  local size = f:seek("end")
+  f:seek("set", math.max(0, size - 65536))
+  local chunk = f:read("*a") or ""
+  f:close()
+  local last
+  for c in chunk:gmatch('"agentColor":"(%a+)"') do last = c end
+  return last
+end
+
+local function applyColor(rec, hex)
+  if hex == rec.color then return end
+  rec.color = hex
+  rec.canvas[1].strokeColor = { hex = hex, alpha = 1.0 }
+end
+
+local function watchTranscript(rec)
+  if rec.watcher then rec.watcher:stop(); rec.watcher = nil end
+  if not rec.transcript then return end
+  local debounced = hs.timer.delayed.new(1.0, function()
+    local name = lastColorIn(rec.transcript)
+    local hex = name and obj.colors[name] or nil
+    applyColor(rec, hex or obj.unknownColor)
+  end)
+  rec.watcher = hs.pathwatcher.new(rec.transcript, function() debounced:start() end)
+  rec.watcher:start()
+  debounced:start()   -- resolve once immediately
+end
+
+--------------------------------------------------------------------------------
 -- Public API
 --------------------------------------------------------------------------------
 
---- ClaudeBorder:paint(tty, color[, mode]) -> string
---- Claim the Terminal window owning `tty`. `mode` is "solid" (default) or "blink".
-function obj:paint(tty, color, mode)
-  local hex = obj.colors[color] or color
+--- ClaudeBorder:paint(tty, color[, mode[, transcript]]) -> string
+--- Claim the Terminal window owning `tty`. `mode` is "solid" (default) or
+--- "blink". Passing the session's transcript path keeps the colour in sync with
+--- /color without waiting for a hook.
+function obj:paint(tty, color, mode, transcript)
+  local hex = obj.colors[color] or (color and color:match("^#%x%x%x%x%x%x$")) or obj.unknownColor
   local win, title = windowForTTY(tty)
   if not win then return "no window for " .. tostring(tty) end
   obj:clear(tty)
   local rec = { canvas = drawAround(win, hex), color = hex, win = win,
-                mode = mode or "solid", title = title }
+                mode = mode or "solid", title = title, transcript = transcript }
   painted[tty] = rec
+  if transcript then watchTranscript(rec) end
   if not shown then rec.canvas:hide() end
   if rec.mode == "blink" then startBlink(rec) end
   return ("painted %s (%s) %s %s"):format(tty, title, hex, rec.mode)
@@ -188,6 +238,7 @@ function obj:clear(tty)
   local rec = painted[tty]
   if rec then
     stopTimer(rec)
+    if rec.watcher then rec.watcher:stop(); rec.watcher = nil end
     rec.canvas:delete()
     painted[tty] = nil
   end
@@ -297,7 +348,7 @@ function obj:start()
     if p.color == "off" then
       obj:clear(p.tty)
     elseif p.color then
-      obj:paint(p.tty, p.color, p.mode)
+      obj:paint(p.tty, p.color, p.mode, p.transcript)
     elseif p.mode then
       obj:mode(p.tty, p.mode)
     end

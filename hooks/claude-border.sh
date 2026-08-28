@@ -35,13 +35,21 @@ if [ -n "$transcript" ] && [ -f "$transcript" ]; then
   color="$(grep -o '"agentColor":"[a-z]*"' "$transcript" 2>/dev/null \
            | tail -1 | sed 's/.*:"//;s/"//')"
 fi
-case "$color" in default|reset|none|gray|grey|"") color="cyan" ;; esac
+# "unknown" is resolved by the Spoon to a neutral grey. Never fall back to one of
+# the eight real colours -- that turns "no colour found" into "wrong colour".
+case "$color" in default|reset|none|gray|grey|"") color="unknown" ;; esac
 
-if [ "$MODE" = "paint" ]; then
-  open -g "hammerspoon://border?tty=${tty}&color=${color}&mode=solid" 2>/dev/null
-else
-  # Repaint rather than flip mode: self-heals a window that was never claimed
-  # (Hammerspoon restart, session predating the hook) and picks up /color changes.
-  open -g "hammerspoon://border?tty=${tty}&color=${color}&mode=${MODE}" 2>/dev/null
+# Hand over the transcript so Hammerspoon can track /color live. /color is a
+# built-in and fires no hook, so without this the colour only lands on the next
+# submitted prompt.
+enc=""
+if [ -n "$transcript" ]; then
+  enc="$(/usr/bin/python3 -c 'import sys,urllib.parse;print(urllib.parse.quote(sys.argv[1],safe=""))' \
+        "$transcript" 2>/dev/null)"
 fi
+
+url="hammerspoon://border?tty=${tty}&color=${color}"
+[ "$MODE" = "paint" ] && url="${url}&mode=solid" || url="${url}&mode=${MODE}"
+[ -n "$enc" ] && url="${url}&transcript=${enc}"
+open -g "$url" 2>/dev/null
 exit 0

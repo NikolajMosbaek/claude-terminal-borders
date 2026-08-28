@@ -62,6 +62,15 @@ The hook resolves its own tty by walking up the process tree, reads the last
 (`/color` is stored there, not in settings), and pokes Hammerspoon over a
 `hammerspoon://border?…` URL.
 
+`/color` is a built-in command and fires no hook, so the hook alone would only
+pick up a colour change on your next submitted prompt. The Spoon therefore also
+watches the session transcript directly (`hs.pathwatcher`, debounced, reading
+only the tail) and recolours within about a second of the command.
+
+A session whose colour cannot be determined gets a neutral grey, never one of
+the eight — a fallback that looks like a valid choice turns "no colour found"
+into "wrong colour shown".
+
 ```
 tty → claude pid → ~/.claude/sessions/<pid>.json → sessionId → transcript → /color
 ```
