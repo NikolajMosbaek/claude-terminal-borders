@@ -67,9 +67,9 @@ pick up a colour change on your next submitted prompt. The Spoon therefore also
 watches the session transcript directly (`hs.pathwatcher`, debounced, reading
 only the tail) and recolours within about a second of the command.
 
-A session whose colour cannot be determined gets a neutral grey, never one of
-the eight — a fallback that looks like a valid choice turns "no colour found"
-into "wrong colour shown".
+A session that has not run `/color` gets **no border at all**. The window is
+still tracked and its transcript still watched, so the border appears the moment
+you run `/color`, and disappears again on `/color default`.
 
 ```
 tty → claude pid → ~/.claude/sessions/<pid>.json → sessionId → transcript → /color

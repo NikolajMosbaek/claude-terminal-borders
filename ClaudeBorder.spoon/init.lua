@@ -54,11 +54,9 @@ obj.colors = {
   cyan   = "#64d2ff", blue   = "#0a84ff", purple = "#bf5af0", pink   = "#ff375f",
 }
 
---- ClaudeBorder.unknownColor (String)
---- Used when a session's /color cannot be determined. Deliberately NOT one of
---- the eight: a fallback that looks like a valid choice turns "no colour found"
---- into "wrong colour shown".
-obj.unknownColor = "#8e8e93"
+-- A session whose /color has not been set gets NO border at all. The window is
+-- still tracked and its transcript still watched, so the border appears the
+-- moment /color runs -- there is simply nothing to draw until then.
 
 --------------------------------------------------------------------------------
 -- Internal state
@@ -177,10 +175,17 @@ local function lastColorIn(path)
   return last
 end
 
+-- A border is drawn only when the session has a colour AND borders are showing.
+local function updateVisibility(rec)
+  if shown and rec.color then rec.canvas:show() else rec.canvas:hide() end
+end
+
+-- hex may be nil, meaning "/color has not been run" -- draw nothing.
 local function applyColor(rec, hex)
   if hex == rec.color then return end
   rec.color = hex
-  rec.canvas[1].strokeColor = { hex = hex, alpha = 1.0 }
+  if hex then rec.canvas[1].strokeColor = { hex = hex, alpha = 1.0 } end
+  updateVisibility(rec)
 end
 
 local function watchTranscript(rec)
@@ -188,8 +193,7 @@ local function watchTranscript(rec)
   if not rec.transcript then return end
   local debounced = hs.timer.delayed.new(1.0, function()
     local name = lastColorIn(rec.transcript)
-    local hex = name and obj.colors[name] or nil
-    applyColor(rec, hex or obj.unknownColor)
+    applyColor(rec, name and obj.colors[name] or nil)
   end)
   rec.watcher = hs.pathwatcher.new(rec.transcript, function() debounced:start() end)
   rec.watcher:start()
@@ -205,17 +209,17 @@ end
 --- "blink". Passing the session's transcript path keeps the colour in sync with
 --- /color without waiting for a hook.
 function obj:paint(tty, color, mode, transcript)
-  local hex = obj.colors[color] or (color and color:match("^#%x%x%x%x%x%x$")) or obj.unknownColor
+  local hex = obj.colors[color] or (color and color:match("^#%x%x%x%x%x%x$")) or nil
   local win, title = windowForTTY(tty)
   if not win then return "no window for " .. tostring(tty) end
   obj:clear(tty)
-  local rec = { canvas = drawAround(win, hex), color = hex, win = win,
+  local rec = { canvas = drawAround(win, hex or "#000000"), color = hex, win = win,
                 mode = mode or "solid", title = title, transcript = transcript }
   painted[tty] = rec
+  updateVisibility(rec)
   if transcript then watchTranscript(rec) end
-  if not shown then rec.canvas:hide() end
   if rec.mode == "blink" then startBlink(rec) end
-  return ("painted %s (%s) %s %s"):format(tty, title, hex, rec.mode)
+  return ("painted %s (%s) %s %s"):format(tty, title, hex or "no colour", rec.mode)
 end
 
 --- ClaudeBorder:mode(tty, mode) -> string
@@ -256,7 +260,7 @@ end
 function obj:list()
   local out = {}
   for tty, rec in pairs(painted) do
-    out[#out + 1] = ("%s %s %s"):format(tty, rec.color, rec.mode)
+    out[#out + 1] = ("%s %s %s"):format(tty, rec.color or "(no colour)", rec.mode)
   end
   table.sort(out)
   return table.concat(out, "\n")
@@ -265,9 +269,7 @@ end
 --- ClaudeBorder:setVisible(bool) -> string
 function obj:setVisible(v)
   shown = v
-  for _, rec in pairs(painted) do
-    if v then rec.canvas:show() else rec.canvas:hide() end
-  end
+  for _, rec in pairs(painted) do updateVisibility(rec) end
   return "visible=" .. tostring(v)
 end
 
