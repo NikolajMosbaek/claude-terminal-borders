@@ -129,13 +129,17 @@ The terminal apps searched (and their AppleScript) live in
 `ClaudeBorder.terminalApps`; every script is wrapped in `with timeout` so a
 busy terminal can't stall Hammerspoon.
 
-### Waiting indicator & hotkey
+### Menubar item & hotkey
 
 Occlusion clipping means a fully covered window shows no border at all — so a
-blinking session can be invisible. While at least one session is waiting, a
-menubar item shows **one dot per waiting session, in its border colour**; its
-menu lists the windows and clicking an entry focuses one. The item disappears
-when nothing is waiting.
+blinking session can be invisible. The menubar item is the signal that
+survives that: **one dot per waiting session, in its border colour**, or a
+quiet `▢` when nothing waits. Its menu lists the waiting windows (clicking an
+entry focuses one, selecting its tab if needed) and carries **Disable/Enable
+Borders** — a master switch that hides every border while keeping the
+sessions tracked, so re-enabling brings everything straight back. The choice
+persists across Hammerspoon restarts (`hs.settings`), and the item dims while
+disabled. `spoon.ClaudeBorder:setEnabled(false)` does the same from the CLI.
 
 **⌃⌥⌘B** focuses the next waiting session (sorted by tty) and clears its
 blink; pressing it repeatedly walks through every waiting session. Configure
@@ -189,7 +193,7 @@ cb.dimAlpha      = 0.12     -- raise for a gentler pulse
 cb.autoHide      = false    -- true: hide all borders when Terminal isn't frontmost
 cb.rescanOnStart = true     -- rebuild borders for already-running sessions
 cb.zPollInterval = 2.0      -- safety-net restack, seconds; 0 disables
-cb.menubar       = true     -- dots in the menubar while sessions are waiting
+cb.menubar       = true     -- menubar item: waiting dots + Enable/Disable toggle
 cb.focusHotkey   = { {"ctrl","alt","cmd"}, "b" }  -- focus next waiting; false disables
 cb.pruneInterval = 10       -- clear borders of dead sessions, seconds; 0 disables
 cb.tabCacheTTL   = 0.3      -- seconds the selected-tab answer is cached
@@ -213,6 +217,7 @@ hs -c 'spoon.ClaudeBorder:rescan()'
 hs -c 'spoon.ClaudeBorder:list()'
 hs -c 'spoon.ClaudeBorder:waiting()'
 hs -c 'spoon.ClaudeBorder:focusNextWaiting()'
+hs -c 'spoon.ClaudeBorder:setEnabled(false)'
 hs -c 'spoon.ClaudeBorder:prune()'
 hs -c 'spoon.ClaudeBorder:clearAll()'
 ```
@@ -230,7 +235,7 @@ open -g "hammerspoon://border?tty=/dev/ttys001&color=off"
 ./test/run.sh
 ```
 
-Runs a headless suite (41 checks) against the **installed** spoon inside the
+Runs a headless suite (45 checks) against the **installed** spoon inside the
 live Hammerspoon: the AX/AppleScript layer is stubbed with fake windows, so
 occlusion punching, visibility, z-ordering, blink and the in-place repaint are
 verified numerically — it even works with the screen locked.

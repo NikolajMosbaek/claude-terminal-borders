@@ -14,7 +14,7 @@ local obj = {}
 obj.__index = obj
 
 obj.name     = "ClaudeBorder"
-obj.version  = "2.2"
+obj.version  = "2.3"
 obj.author   = "Nikolaj Søgaard Simonsen"
 obj.homepage = "https://github.com/NikolajMosbaek/claude-terminal-borders"
 obj.license  = "MIT - https://opensource.org/licenses/MIT"
@@ -61,12 +61,18 @@ obj.rescanOnStart = true
 obj.zPollInterval = 2.0
 
 --- ClaudeBorder.menubar (Boolean)
---- Show a menubar item while at least one session is waiting for input: one
---- dot per waiting session, in its border colour. Occlusion clipping means a
---- fully covered window shows no border at all, so a blinking session can be
---- invisible -- the menubar dot is the signal that survives that. Clicking a
---- dot's menu entry focuses that window.
+--- Show a menubar item: one dot per waiting session, in its border colour,
+--- or a quiet frame glyph when nothing waits (dimmed while borders are
+--- disabled). Occlusion clipping means a fully covered window shows no border
+--- at all, so a blinking session can be invisible -- the menubar dot is the
+--- signal that survives that. The menu focuses waiting windows and carries
+--- the Enable/Disable Borders toggle.
 obj.menubar = true
+
+--- ClaudeBorder.settingsKey (String)
+--- hs.settings key that persists the Enable/Disable toggle across Hammerspoon
+--- restarts.
+obj.settingsKey = "ClaudeBorder.enabled"
 
 --- ClaudeBorder.focusHotkey (Table | false)
 --- Hotkey that focuses the next waiting session (and thereby clears its
@@ -213,7 +219,8 @@ obj.terminalApps = {
 
 local painted    = {}     -- [tty] = { canvas, color, mode, timer, win, title,
                           --           transcript, watcher, onScreen, holeKey }
-local shown      = true
+local shown      = true   -- the autoHide machinery's flag
+local enabled    = true   -- the user's master switch (menubar / setEnabled)
 local restacking = false
 local restackDelayed          -- hs.timer.delayed coalescing restack requests
 local wf, appWatcher, spaceWatcher, powerWatcher, pollTimer, pruneTimer
@@ -404,24 +411,43 @@ local function liveTitle(rec)
 end
 
 local function updateMenubar()
-  local waiting = obj.menubar and waitingRecs() or {}
-  if #waiting == 0 then
+  if not obj.menubar then
     if bar then bar:delete(); bar = nil; obj._bar = nil end
     return
   end
   if not bar then bar = hs.menubar.new(); obj._bar = bar end
-  local title = hs.styledtext.new("")
+
+  -- Title: one dot per waiting session in its colour; a quiet frame glyph
+  -- when nothing waits. Everything dims while borders are disabled.
+  local dim = enabled and 1.0 or 0.35
+  local waiting = waitingRecs()
+  local title
+  if #waiting > 0 then
+    title = hs.styledtext.new("")
+    for _, e in ipairs(waiting) do
+      local hex = e.rec.color or "#8e8e93"   -- colourless sessions get a grey dot
+      title = title .. hs.styledtext.new("●", { color = { hex = hex, alpha = dim } })
+    end
+  else
+    title = hs.styledtext.new("▢", { color = { hex = "#8e8e93", alpha = dim } })
+  end
+  bar:setTitle(title)
+
   local items = {}
   for _, e in ipairs(waiting) do
-    local hex = e.rec.color or "#8e8e93"   -- colourless sessions get a grey dot
-    title = title .. hs.styledtext.new("●", { color = { hex = hex } })
+    local hex = e.rec.color or "#8e8e93"
     items[#items + 1] = {
       title = hs.styledtext.new("● ", { color = { hex = hex } })
               .. hs.styledtext.new(("%s  (%s)"):format(liveTitle(e.rec), e.tty)),
       fn = function() obj:focus(e.tty) end,
     }
   end
-  bar:setTitle(title)
+  if #items > 0 then items[#items + 1] = { title = "-" } end
+  items[#items + 1] = {
+    title = enabled and "Disable Borders" or "Enable Borders",
+    fn = function() obj:setEnabled(not enabled) end,
+  }
+  items[#items + 1] = { title = "Rescan Sessions", fn = function() obj:rescan() end }
   bar:setMenu(items)
 end
 
@@ -431,7 +457,8 @@ end
 -- tabSelected is nil when unknown -- only a definite "another tab is selected"
 -- hides the border.
 local function updateVisibility(rec)
-  if shown and rec.color and rec.onScreen ~= false and rec.tabSelected ~= false then
+  if enabled and shown and rec.color and rec.onScreen ~= false
+     and rec.tabSelected ~= false then
     rec.canvas:show()
   else
     rec.canvas:hide()
@@ -810,6 +837,20 @@ function obj:restack()
   return "restacked"
 end
 
+--- ClaudeBorder:setEnabled(bool) -> string
+--- Master switch, also in the menubar item's menu. Disabling hides every
+--- border but keeps the sessions tracked (hooks, transcripts, waiting state),
+--- so re-enabling brings everything straight back. Persists across
+--- Hammerspoon restarts via hs.settings.
+function obj:setEnabled(v)
+  enabled = v ~= false
+  pcall(function() hs.settings.set(obj.settingsKey, enabled) end)
+  for _, rec in pairs(painted) do updateVisibility(rec) end
+  updateMenubar()
+  if enabled then scheduleRestack() end
+  return "enabled=" .. tostring(enabled)
+end
+
 --- ClaudeBorder:setVisible(bool) -> string
 function obj:setVisible(v)
   shown = v
@@ -942,6 +983,12 @@ function obj:start()
 
   local front = hs.application.frontmostApplication()
   shown = (not obj.autoHide) or (front ~= nil and isTerminalApp(front:name()))
+
+  -- The user's last Enable/Disable choice survives a restart; the menubar
+  -- item is persistent, so it exists (as the idle glyph) from the start.
+  local okS, stored = pcall(function() return hs.settings.get(obj.settingsKey) end)
+  enabled = not (okS and stored == false)
+  updateMenubar()
 
   -- URL bridge, used by the Claude Code hook:
   --   open -g "hammerspoon://border?tty=/dev/ttys001&color=green&mode=blink"

@@ -89,6 +89,7 @@ local ok, err = pcall(function()
   local dev = dofile(os.getenv("HOME") .. "/.hammerspoon/Spoons/ClaudeBorder.spoon/init.lua")
   dev.menubar = false      -- keep the test run out of the real menubar
   dev.tabCacheTTL = 0      -- selected-tab answers must not be cached mid-test
+  dev.settingsKey = "ClaudeBorderTest.enabled"   -- never touch the real toggle
   local W = dev.width      -- 5
   local R = dev.radius     -- 11
 
@@ -199,6 +200,18 @@ local ok, err = pcall(function()
   dev:focus("/dev/ttyTEST_B")
   check("focus selects the tab", selectLog[1] == "/dev/ttyTEST_B", hs.inspect(selectLog))
 
+  -- setEnabled(false) hides every border but keeps sessions tracked;
+  -- re-enabling brings them straight back.
+  dev:setEnabled(false)
+  check("disable hides all borders", not cA:isShowing() and not cB:isShowing(),
+        tostring(cA:isShowing()) .. "/" .. tostring(cB:isShowing()))
+  check("disabled sessions stay tracked", dev:list():find("ttyTEST_A", 1, true) ~= nil, dev:list())
+  check("disabled state persists", hs.settings.get("ClaudeBorderTest.enabled") == false,
+        tostring(hs.settings.get("ClaudeBorderTest.enabled")))
+  dev:setEnabled(true)
+  check("enable restores borders", cA:isShowing() and cB:isShowing(),
+        tostring(cA:isShowing()) .. "/" .. tostring(cB:isShowing()))
+
   -- prune() clears ttys with no live claude; a failed ps clears nothing.
   hs.execute = function() return "" end
   check("prune on failed ps clears nothing", dev:prune():find("pruned 0") ~= nil, dev:prune())
@@ -223,6 +236,7 @@ hs.osascript.applescript = realOsascript
 hs.canvas.new = realCanvasNew
 hs.execute = realExecute
 hs.alert.show = realAlert
+pcall(function() hs.settings.clear("ClaudeBorderTest.enabled") end)
 for _, c in ipairs(madeCanvases) do pcall(function() c:delete() end) end
 
 if not ok then results[#results + 1] = "ERROR: " .. tostring(err) end
