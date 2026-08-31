@@ -112,6 +112,15 @@ app activation, Space switches, and a low-frequency safety poll for z-order
 changes that fire no event (`zPollInterval`). Unchanged geometry is detected
 and skipped, so the steady state costs nothing to redraw.
 
+Interactive changes don't wait for any of that: window-filter events are
+debounced and often arrive only when a drag *ends*, so the Spoon also listens
+to the mouse itself. Every click schedules a restack (a click is what raises
+or buries a window), and while the button is held a ~16Hz loop follows the
+focused window's frame with a cached-z-order light pass (~1ms vs ~35ms for a
+full one) — the border, and the punches it cuts into its neighbours, track
+the drag live. Dragging a window without focusing it (⌘-drag) is the one case
+left to the safety poll.
+
 ### Blink
 
 `Stop` and `Notification` blink the border because Claude is waiting for you.

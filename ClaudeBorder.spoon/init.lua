@@ -14,7 +14,7 @@ local obj = {}
 obj.__index = obj
 
 obj.name     = "ClaudeBorder"
-obj.version  = "2.5"
+obj.version  = "2.6"
 obj.author   = "Nikolaj Søgaard Simonsen"
 obj.homepage = "https://github.com/NikolajMosbaek/claude-terminal-borders"
 obj.license  = "MIT - https://opensource.org/licenses/MIT"
@@ -242,6 +242,8 @@ local restackDelayed          -- hs.timer.delayed coalescing restack requests
 local wf, appWatcher, spaceWatcher, powerWatcher, pollTimer, pruneTimer
 local bar, hotkeyObj           -- persistent menubar item, hotkey
 local scheduleRestack          -- forward: the coalesced-restack scheduler
+local lastStack                -- ordered-window data from the last full restack
+local dragTap, dragTimer, dragLast   -- mouse-driven responsiveness (see start)
 
 -- One-shot timers must be retained until they fire: an hs.timer.doAfter whose
 -- return value is dropped can be garbage-collected first and silently never
@@ -648,27 +650,37 @@ end
 -- scheduleRestack(), whose delayed timer runs outside the handler. Calling
 -- canvas:show() from inside a window-event handler re-triggers window events
 -- and overflows the Lua stack.
-local function restack()
+-- `light` reuses the ordered-window data from the last full pass: the full
+-- pass costs ~35ms (orderedWindows does AX work per window on screen), a
+-- cached pass ~1ms, so the drag-follow loop can run it at drag rate. Painted
+-- windows' frames are always read live either way.
+local function restack(light)
   if restacking then return end
   restacking = true
 
   local ok, err = pcall(function()
-    local ordered = hs.window.orderedWindows() or {}   -- front to back, all apps
-    local zOf, ids, frames = {}, {}, {}
-    for i, w in ipairs(ordered) do
-      local id = windowId(w)
-      if id then
-        zOf[id], ids[i] = i, id
-        local okF, f = pcall(w.frame, w)
-        if okF then frames[i] = f end
+    local zOf, ids, frames
+    if light and lastStack then
+      zOf, ids, frames = lastStack.zOf, lastStack.ids, lastStack.frames
+    else
+      local ordered = hs.window.orderedWindows() or {}   -- front to back, all apps
+      zOf, ids, frames = {}, {}, {}
+      for i, w in ipairs(ordered) do
+        local id = windowId(w)
+        if id then
+          zOf[id], ids[i] = i, id
+          local okF, f = pcall(w.frame, w)
+          if okF then frames[i] = f end
+        end
       end
+      lastStack = { zOf = zOf, ids = ids, frames = frames }
     end
 
     -- Two sessions in two tabs of one window would otherwise fight over the
     -- same border: only the selected tab's session shows. The others stay
     -- tracked (and keep blinking into the menubar) while hidden. The answer
     -- comes from the background refresh; kick one and read the latest.
-    if next(painted) then refreshSelected() end
+    if not light and next(painted) then refreshSelected() end
     local selSet = selCache
 
     -- Occluders that carry a border of their own get their punch inflated by
@@ -703,6 +715,7 @@ local function restack()
         if selSet then rec.tabSelected = (selSet[tty] == true) else rec.tabSelected = nil end
         local z = zOf[windowId(rec.win)]
         rec.onScreen = z ~= nil
+        if z then frames[z] = f end   -- keep the cache fresh for light passes
         if z then
           byZ[#byZ + 1] = { z = z, rec = rec }
           local w = obj.width
@@ -745,9 +758,46 @@ end
 
 scheduleRestack = function()
   if not restackDelayed then
-    restackDelayed = hs.timer.delayed.new(0.05, restack)
+    restackDelayed = hs.timer.delayed.new(0.05, function() restack() end)
   end
   restackDelayed:start()
+end
+
+--------------------------------------------------------------------------------
+-- Mouse-driven responsiveness
+--
+-- hs.window.filter delivers move/raise events debounced and often only when a
+-- drag ENDS, and the safety poll runs every 2s -- so a dragged or backgrounded
+-- window could wear a stale border for whole seconds. The input is the honest
+-- signal: while the left button is down, a ~16Hz loop reads the focused
+-- window's frame and runs a cached-order light restack when it changed, so
+-- borders (and the punches they cut in neighbours) follow the drag live.
+-- Mouse-down and mouse-up each schedule a full restack for the raise/lower.
+--------------------------------------------------------------------------------
+
+local function stopDragWatch()
+  if dragTimer then dragTimer:stop(); dragTimer = nil end
+  dragLast = nil
+end
+
+local function startDragWatch()
+  stopDragWatch()
+  if not next(painted) then return end
+  dragTimer = hs.timer.doEvery(0.06, function()
+    local w = hs.window.focusedWindow()
+    local id = windowId(w)
+    local z = id and lastStack and lastStack.zOf[id]
+    if not z then return end
+    local okF, f = pcall(w.frame, w)
+    if not okF or not f then return end
+    if dragLast and dragLast.id == id and dragLast.x == f.x and dragLast.y == f.y
+       and dragLast.w == f.w and dragLast.h == f.h then
+      return   -- the button is down but nothing is moving
+    end
+    dragLast = { id = id, x = f.x, y = f.y, w = f.w, h = f.h }
+    lastStack.frames[z] = f
+    restack(true)
+  end)
 end
 
 --------------------------------------------------------------------------------
@@ -1061,6 +1111,16 @@ end
 function obj:start()
   require("hs.ipc")   -- enables the `hs` command line tool
 
+  -- Bound every Accessibility round trip. A busy app (a Terminal printing
+  -- Claude output, say) answers AX messages late, and the DEFAULT messaging
+  -- timeout is several seconds -- one slow window frame read then stalls a
+  -- whole restack (observed: a single 1.6s spike). 0.5s keeps the worst case
+  -- bounded; a window that can't answer in time is treated as stale and
+  -- healed asynchronously like any other.
+  pcall(function()
+    require("hs.axuielement").systemWideElement():setTimeout(0.5)
+  end)
+
   -- All apps, not just Terminal: any window can occlude a border, so any
   -- window's move/close/raise must trigger a restack. Hammerspoon's own
   -- windows are rejected so canvas frame changes can never feed back in.
@@ -1129,6 +1189,22 @@ function obj:start()
   spaceWatcher = hs.spaces.watcher.new(scheduleRestack)
   spaceWatcher:start()
   obj._spaceWatcher = spaceWatcher
+
+  -- Clicks change z-order immediately; window-filter events about it arrive
+  -- late. React to the input itself, and follow drags live (see above).
+  local types = hs.eventtap.event.types
+  dragTap = hs.eventtap.new({ types.leftMouseDown, types.leftMouseUp }, function(e)
+    if e:getType() == types.leftMouseDown then
+      scheduleRestack()   -- the click may have raised the window under it
+      startDragWatch()
+    else
+      stopDragWatch()
+      scheduleRestack()   -- release: z-order and frame are settled
+    end
+    return false
+  end)
+  dragTap:start()
+  obj._dragTap = dragTap
 
   -- A locked screen degrades the Accessibility API system-wide: windows
   -- enumerate but report no frames, so any paint attempted while locked fails
@@ -1215,6 +1291,8 @@ function obj:stop()
   if hotkeyObj then hotkeyObj:delete(); hotkeyObj = nil; obj._hotkey = nil end
   if bar then bar:delete(); bar = nil end
   if pillCanvas then pillCanvas:delete(); pillCanvas = nil; obj._pill = nil end
+  if dragTap then dragTap:stop(); dragTap = nil; obj._dragTap = nil end
+  stopDragWatch()
   if blinkTimer then blinkTimer:stop(); blinkTimer = nil end
   if restackDelayed then restackDelayed:stop() end
   cancelPending()
