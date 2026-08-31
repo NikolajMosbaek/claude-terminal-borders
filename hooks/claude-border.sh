@@ -24,29 +24,26 @@ if [ "$MODE" = "clear" ]; then
   exit 0
 fi
 
-# /color lives in the session transcript, not in settings.
-transcript="$(printf '%s' "$payload" | /usr/bin/python3 -c \
-  'import sys,json
-try: print(json.load(sys.stdin).get("transcript_path",""))
-except Exception: print("")' 2>/dev/null)"
+# /color lives in the session transcript, not in settings. One python does both
+# jobs: extract the transcript path from the hook payload and URL-encode it.
+out="$(printf '%s' "$payload" | /usr/bin/python3 -c \
+  'import sys, json, urllib.parse
+try: t = json.load(sys.stdin).get("transcript_path", "") or ""
+except Exception: t = ""
+print(t)
+print(urllib.parse.quote(t, safe=""))' 2>/dev/null)"
+transcript="$(printf '%s' "$out" | sed -n 1p)"
+enc="$(printf '%s' "$out" | sed -n 2p)"
 
 color=""
 if [ -n "$transcript" ] && [ -f "$transcript" ]; then
   color="$(grep -o '"agentColor":"[a-z]*"' "$transcript" 2>/dev/null \
            | tail -1 | sed 's/.*:"//;s/"//')"
 fi
-# "unknown" is resolved by the Spoon to a neutral grey. Never fall back to one of
-# the eight real colours -- that turns "no colour found" into "wrong colour".
+# "unknown" resolves to no colour in the Spoon: the window is claimed and its
+# transcript watched, but nothing is drawn until /color is run. Never fall back
+# to one of the eight real colours -- that turns "no colour" into "wrong colour".
 case "$color" in default|reset|none|gray|grey|"") color="unknown" ;; esac
-
-# Hand over the transcript so Hammerspoon can track /color live. /color is a
-# built-in and fires no hook, so without this the colour only lands on the next
-# submitted prompt.
-enc=""
-if [ -n "$transcript" ]; then
-  enc="$(/usr/bin/python3 -c 'import sys,urllib.parse;print(urllib.parse.quote(sys.argv[1],safe=""))' \
-        "$transcript" 2>/dev/null)"
-fi
 
 url="hammerspoon://border?tty=${tty}&color=${color}"
 [ "$MODE" = "paint" ] && url="${url}&mode=solid" || url="${url}&mode=${MODE}"
