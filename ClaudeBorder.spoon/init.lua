@@ -14,7 +14,7 @@ local obj = {}
 obj.__index = obj
 
 obj.name     = "ClaudeBorder"
-obj.version  = "2.0"
+obj.version  = "2.1"
 obj.author   = "Nikolaj Søgaard Simonsen"
 obj.homepage = "https://github.com/NikolajMosbaek/claude-terminal-borders"
 obj.license  = "MIT - https://opensource.org/licenses/MIT"
@@ -60,6 +60,26 @@ obj.rescanOnStart = true
 --- focus, an app un-hidden behind another). 0 disables the poll.
 obj.zPollInterval = 2.0
 
+--- ClaudeBorder.menubar (Boolean)
+--- Show a menubar item while at least one session is waiting for input: one
+--- dot per waiting session, in its border colour. Occlusion clipping means a
+--- fully covered window shows no border at all, so a blinking session can be
+--- invisible -- the menubar dot is the signal that survives that. Clicking a
+--- dot's menu entry focuses that window.
+obj.menubar = true
+
+--- ClaudeBorder.focusHotkey (Table | false)
+--- Hotkey that focuses the next waiting session (and thereby clears its
+--- blink), as `{ mods, key }`. Default ⌃⌥⌘B. Set to false to disable.
+obj.focusHotkey = { { "ctrl", "alt", "cmd" }, "b" }
+
+--- ClaudeBorder.pruneInterval (Number)
+--- Seconds between checks that every painted tty still hosts a live claude
+--- process. SessionEnd only fires on a clean exit; a crashed or killed claude
+--- would otherwise leave its border painted until the window closes.
+--- 0 disables.
+obj.pruneInterval = 10
+
 --- ClaudeBorder.colors (Table)
 --- Maps Claude Code's eight /color names to hex. A raw "#rrggbb" also works
 --- anywhere a colour name is accepted.
@@ -81,7 +101,26 @@ local painted    = {}     -- [tty] = { canvas, color, mode, timer, win, title,
 local shown      = true
 local restacking = false
 local restackDelayed          -- hs.timer.delayed coalescing restack requests
-local wf, appWatcher, spaceWatcher, powerWatcher, pollTimer
+local wf, appWatcher, spaceWatcher, powerWatcher, pollTimer, pruneTimer
+local bar, hotkeyObj           -- menubar item (present only while waiting), hotkey
+
+-- One-shot timers must be retained until they fire: an hs.timer.doAfter whose
+-- return value is dropped can be garbage-collected first and silently never
+-- run (observed: the start-time rescans never firing).
+local pendingTimers = {}
+local function after(delay, fn)
+  local t
+  t = hs.timer.doAfter(delay, function()
+    pendingTimers[t] = nil
+    fn()
+  end)
+  pendingTimers[t] = true
+end
+
+local function cancelPending()
+  for t in pairs(pendingTimers) do t:stop() end
+  pendingTimers = {}
+end
 
 --------------------------------------------------------------------------------
 -- Window lookup
@@ -182,6 +221,51 @@ local function startBlink(rec)
       rec.canvas:alpha(rec.canvas:alpha() > 0.5 and obj.dimAlpha or 1.0)
     end
   end)
+end
+
+--------------------------------------------------------------------------------
+-- Waiting indicator
+--
+-- Occlusion clipping means a fully covered window shows no border at all, so a
+-- blinking (waiting) session can be invisible. The menubar item is the signal
+-- that survives that: one dot per waiting session, in its border colour, with
+-- a menu that focuses the window. It exists only while something is waiting.
+--------------------------------------------------------------------------------
+
+local function waitingRecs()
+  local out = {}
+  for tty, rec in pairs(painted) do
+    if rec.mode == "blink" then out[#out + 1] = { tty = tty, rec = rec } end
+  end
+  table.sort(out, function(a, b) return a.tty < b.tty end)
+  return out
+end
+
+local function liveTitle(rec)
+  local ok, t = pcall(function() return rec.win and rec.win:title() end)
+  return (ok and t and #t > 0 and t) or rec.title or "?"
+end
+
+local function updateMenubar()
+  local waiting = obj.menubar and waitingRecs() or {}
+  if #waiting == 0 then
+    if bar then bar:delete(); bar = nil; obj._bar = nil end
+    return
+  end
+  if not bar then bar = hs.menubar.new(); obj._bar = bar end
+  local title = hs.styledtext.new("")
+  local items = {}
+  for _, e in ipairs(waiting) do
+    local hex = e.rec.color or "#8e8e93"   -- colourless sessions get a grey dot
+    title = title .. hs.styledtext.new("●", { color = { hex = hex } })
+    items[#items + 1] = {
+      title = hs.styledtext.new("● ", { color = { hex = hex } })
+              .. hs.styledtext.new(("%s  (%s)"):format(liveTitle(e.rec), e.tty)),
+      fn = function() obj:focus(e.tty) end,
+    }
+  end
+  bar:setTitle(title)
+  bar:setMenu(items)
 end
 
 -- A border is drawn only when the session has a colour AND its window is
@@ -348,6 +432,7 @@ local function applyColor(rec, hex)
   rec.color = hex
   if hex then rec.canvas[1].strokeColor = { hex = hex, alpha = 1.0 } end
   updateVisibility(rec)
+  updateMenubar()   -- a waiting session's dot follows its colour
 end
 
 local function watchTranscript(rec)
@@ -405,6 +490,7 @@ function obj:paint(tty, color, mode, transcript)
           mode = mode, title = title, transcript = transcript }
   painted[tty] = rec
   updateVisibility(rec)
+  updateMenubar()
   if transcript then watchTranscript(rec) end
   if rec.mode == "blink" then startBlink(rec) end
   restack()   -- punch + order the new canvas before its first frame is seen
@@ -425,6 +511,7 @@ function obj:mode(tty, mode)
     stopTimer(rec)
     rec.canvas:alpha(1.0)
   end
+  updateMenubar()
   return tty .. " -> " .. mode
 end
 
@@ -436,6 +523,7 @@ function obj:clear(tty)
     if rec.watcher then rec.watcher:stop(); rec.watcher = nil end
     rec.canvas:delete()
     painted[tty] = nil
+    updateMenubar()
   end
   return "cleared " .. tostring(tty)
 end
@@ -455,6 +543,61 @@ function obj:list()
   end
   table.sort(out)
   return table.concat(out, "\n")
+end
+
+--- ClaudeBorder:focus(tty) -> string
+--- Focus the window owning `tty` (switching Space if needed). A waiting
+--- border goes solid immediately -- deterministic, rather than waiting for
+--- the focus event to arrive.
+function obj:focus(tty)
+  local rec = painted[tty]
+  if not rec then return "not painted: " .. tostring(tty) end
+  pcall(function() rec.win:focus() end)
+  if rec.mode == "blink" then obj:mode(tty, "solid") end
+  return "focused " .. tty
+end
+
+--- ClaudeBorder:focusNextWaiting() -> string
+--- Focus the first waiting session (sorted by tty), clearing its blink.
+--- Pressing the hotkey repeatedly therefore walks through every waiting
+--- session. Bound to `focusHotkey` (default ⌃⌥⌘B).
+function obj:focusNextWaiting()
+  local waiting = waitingRecs()
+  if #waiting == 0 then
+    hs.alert.show("No Claude session is waiting", 0.7)
+    return "none waiting"
+  end
+  return obj:focus(waiting[1].tty)
+end
+
+--- ClaudeBorder:waiting() -> string
+--- One tty per line, for every session currently waiting for input.
+function obj:waiting()
+  local out = {}
+  for _, e in ipairs(waitingRecs()) do out[#out + 1] = e.tty end
+  return table.concat(out, "\n")
+end
+
+--- ClaudeBorder:prune() -> string
+--- Clear every border whose tty no longer hosts a live claude process.
+--- SessionEnd only fires on a clean exit; this catches crashes and kills.
+--- Runs every `pruneInterval` seconds.
+function obj:prune()
+  if not next(painted) then return "pruned 0" end
+  local out = hs.execute("ps -axo tty=,comm=") or ""
+  if not out:find("%S") then return "pruned 0 (ps gave nothing)" end   -- never clear on a failed ps
+  local live = {}
+  for line in out:gmatch("[^\n]+") do
+    local t, comm = line:match("^%s*(%S+)%s+(.+)$")
+    if t and comm and comm:lower():find("claude", 1, true) then
+      live["/dev/" .. t] = true
+    end
+  end
+  local n = 0
+  for tty in pairs(painted) do
+    if not live[tty] then obj:clear(tty); n = n + 1 end
+  end
+  return ("pruned %d"):format(n)
 end
 
 --- ClaudeBorder:rescan() -> string
@@ -602,7 +745,7 @@ function obj:start()
     if event == hs.caffeinate.watcher.screensDidUnlock
        or event == hs.caffeinate.watcher.sessionDidBecomeActive
        or event == hs.caffeinate.watcher.systemDidWake then
-      hs.timer.doAfter(2, function() obj:rescan() end)
+      after(2, function() obj:rescan() end)
       scheduleRestack()
     end
   end)
@@ -616,6 +759,19 @@ function obj:start()
       if next(painted) then scheduleRestack() end
     end)
     obj._pollTimer = pollTimer
+  end
+
+  -- Clear borders whose claude died without a SessionEnd (crash, kill -9).
+  if obj.pruneInterval and obj.pruneInterval > 0 then
+    pruneTimer = hs.timer.doEvery(obj.pruneInterval, function() obj:prune() end)
+    obj._pruneTimer = pruneTimer
+  end
+
+  -- Jump to the next waiting session from anywhere.
+  if obj.focusHotkey then
+    hotkeyObj = hs.hotkey.bind(obj.focusHotkey[1], obj.focusHotkey[2],
+                               function() obj:focusNextWaiting() end)
+    obj._hotkey = hotkeyObj
   end
 
   local front = hs.application.frontmostApplication()
@@ -638,8 +794,12 @@ function obj:start()
   hs.urlevent.bind("borderoff", function() obj:clearAll() end)
 
   if obj.rescanOnStart then
-    -- Deferred so the window filter has warmed up before the first paints.
-    hs.timer.doAfter(0.5, function() obj:rescan() end)
+    -- The AX/AppleScript layer is not always answerable right at config-load
+    -- time (a rescan 0.5s after hs.reload() has been seen finding no windows),
+    -- so try a few times. rescan is idempotent, so the extra attempts are free.
+    for _, delay in ipairs({ 1, 4, 10 }) do
+      after(delay, function() obj:rescan() end)
+    end
   end
 
   return self
@@ -653,7 +813,11 @@ function obj:stop()
   if spaceWatcher then spaceWatcher:stop(); spaceWatcher = nil; obj._spaceWatcher = nil end
   if powerWatcher then powerWatcher:stop(); powerWatcher = nil; obj._powerWatcher = nil end
   if pollTimer then pollTimer:stop(); pollTimer = nil; obj._pollTimer = nil end
+  if pruneTimer then pruneTimer:stop(); pruneTimer = nil; obj._pruneTimer = nil end
+  if hotkeyObj then hotkeyObj:delete(); hotkeyObj = nil; obj._hotkey = nil end
+  if bar then bar:delete(); bar = nil end
   if restackDelayed then restackDelayed:stop() end
+  cancelPending()
   return self
 end
 

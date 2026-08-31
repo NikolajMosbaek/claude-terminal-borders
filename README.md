@@ -114,6 +114,24 @@ the window you are **already focused on** is downgraded to solid for the same
 reason (and because clicking an already-focused window fires no focus event,
 nothing would ever have stopped it).
 
+### Waiting indicator & hotkey
+
+Occlusion clipping means a fully covered window shows no border at all — so a
+blinking session can be invisible. While at least one session is waiting, a
+menubar item shows **one dot per waiting session, in its border colour**; its
+menu lists the windows and clicking an entry focuses one. The item disappears
+when nothing is waiting.
+
+**⌃⌥⌘B** focuses the next waiting session (sorted by tty) and clears its
+blink; pressing it repeatedly walks through every waiting session. Configure
+with `focusHotkey`, disable with `cb.focusHotkey = false`.
+
+### Pruning
+
+`SessionEnd` only fires on a clean exit. Every `pruneInterval` (10s) the Spoon
+checks that each painted tty still hosts a live `claude` process and clears
+the borders of crashed or killed sessions.
+
 ### Rescan
 
 On start — and again on screen unlock / wake — the Spoon rebuilds borders for
@@ -156,6 +174,9 @@ cb.dimAlpha      = 0.12     -- raise for a gentler pulse
 cb.autoHide      = false    -- true: hide all borders when Terminal isn't frontmost
 cb.rescanOnStart = true     -- rebuild borders for already-running sessions
 cb.zPollInterval = 2.0      -- safety-net restack, seconds; 0 disables
+cb.menubar       = true     -- dots in the menubar while sessions are waiting
+cb.focusHotkey   = { {"ctrl","alt","cmd"}, "b" }  -- focus next waiting; false disables
+cb.pruneInterval = 10       -- clear borders of dead sessions, seconds; 0 disables
 cb.colors.green  = "#32d74b"
 cb:start()
 ```
@@ -174,6 +195,9 @@ hs -c 'spoon.ClaudeBorder:paint("/dev/ttys001", "#ff00ff", "blink")'
 hs -c 'spoon.ClaudeBorder:mode("/dev/ttys001", "solid")'
 hs -c 'spoon.ClaudeBorder:rescan()'
 hs -c 'spoon.ClaudeBorder:list()'
+hs -c 'spoon.ClaudeBorder:waiting()'
+hs -c 'spoon.ClaudeBorder:focusNextWaiting()'
+hs -c 'spoon.ClaudeBorder:prune()'
 hs -c 'spoon.ClaudeBorder:clearAll()'
 ```
 
@@ -190,7 +214,7 @@ open -g "hammerspoon://border?tty=/dev/ttys001&color=off"
 ./test/run.sh
 ```
 
-Runs a headless suite (29 checks) against the **installed** spoon inside the
+Runs a headless suite (37 checks) against the **installed** spoon inside the
 live Hammerspoon: the AX/AppleScript layer is stubbed with fake windows, so
 occlusion punching, visibility, z-ordering, blink and the in-place repaint are
 verified numerically — it even works with the screen locked.
@@ -211,6 +235,11 @@ every subscription below it. `windowMoved` already covers resizes.
 inside a window-event handler, which re-triggers window events. Show/hide (and
 everything else in `restack()`) belongs behind the coalescing timer
 (`scheduleRestack`), which runs outside the handler.
+
+**A scheduled one-shot never fires.** `hs.timer.doAfter` returns a timer object
+that must be retained until it fires; drop it and the garbage collector can
+collect it first, silently. The Spoon keeps every pending one-shot in a table
+(`after()`), the same way it retains the window filter.
 
 **Never make Hammerspoon touch `~/Documents` paths.** Reading a file under
 `~/Documents` (even a `loadfile` syntax check) from a Hammerspoon that has no

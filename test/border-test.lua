@@ -1,4 +1,4 @@
--- Headless test harness for ClaudeBorder v2.0.
+-- Headless test harness for ClaudeBorder.
 -- Stubs the AX/AppleScript layer with fake windows so occlusion punching,
 -- visibility, z-ordering and blink can be verified while the screen is locked.
 -- Runs inside one synchronous hs -c eval; all stubs are restored before return.
@@ -14,11 +14,15 @@ local realAppGet    = hs.application.get
 local realOsascript = hs.osascript.applescript
 local realCanvasNew = hs.canvas.new
 local realFocused   = hs.window.focusedWindow
+local realExecute   = hs.execute
+local realAlert     = hs.alert.show
 
+local focusLog = {}
 local function fakeWin(id, x, y, w, h)
   return {
     id    = function() return id end,
     frame = function() return { x = x, y = y, w = w, h = h } end,
+    focus = function() focusLog[#focusLog + 1] = id end,
   }
 end
 
@@ -61,6 +65,7 @@ end
 -- ---------------------------------------------------------------- dev instance
 local ok, err = pcall(function()
   local dev = dofile(os.getenv("HOME") .. "/.hammerspoon/Spoons/ClaudeBorder.spoon/init.lua")
+  dev.menubar = false      -- keep the test run out of the real menubar
   local W = dev.width      -- 5
   local R = dev.radius     -- 11
 
@@ -142,6 +147,31 @@ local ok, err = pcall(function()
   local resHex = dev:paint("/dev/ttyTEST_C", "#123abc", "solid")
   check("raw hex accepted", resHex:find("#123abc") ~= nil, resHex)
 
+  -- waiting() lists blinking sessions; focusNextWaiting focuses and clears.
+  dev:mode("/dev/ttyTEST_B", "blink")
+  check("waiting lists B", dev:waiting() == "/dev/ttyTEST_B", dev:waiting())
+  focusLog = {}
+  local fres = dev:focusNextWaiting()
+  check("focusNextWaiting focuses B", fres == "focused /dev/ttyTEST_B", fres)
+  check("focus reached the window", focusLog[1] == 103, hs.inspect(focusLog))
+  check("focused session stops waiting", dev:waiting() == "", dev:waiting())
+  local alerted = false
+  hs.alert.show = function() alerted = true end
+  check("focusNextWaiting with none waiting",
+        dev:focusNextWaiting() == "none waiting" and alerted, tostring(alerted))
+  hs.alert.show = realAlert
+
+  -- prune() clears ttys with no live claude; a failed ps clears nothing.
+  hs.execute = function() return "" end
+  check("prune on failed ps clears nothing", dev:prune():find("pruned 0") ~= nil, dev:prune())
+  hs.execute = function() return " ttyTEST_A  claude\n ??        loginwindow\n" end
+  local pres = dev:prune()
+  check("prune clears dead sessions", pres == "pruned 2", pres)
+  check("prune keeps the live session",
+        dev:list():find("ttyTEST_A") ~= nil
+        and not dev:list():find("ttyTEST_B") and not dev:list():find("ttyTEST_C"), dev:list())
+  hs.execute = realExecute
+
   -- clear() releases everything.
   dev:clearAll()
   check("clearAll empties list", dev:list() == "", dev:list())
@@ -153,6 +183,8 @@ hs.window.focusedWindow = realFocused
 hs.application.get = realAppGet
 hs.osascript.applescript = realOsascript
 hs.canvas.new = realCanvasNew
+hs.execute = realExecute
+hs.alert.show = realAlert
 for _, c in ipairs(madeCanvases) do pcall(function() c:delete() end) end
 
 if not ok then results[#results + 1] = "ERROR: " .. tostring(err) end
