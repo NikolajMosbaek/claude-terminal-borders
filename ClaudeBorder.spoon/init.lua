@@ -14,7 +14,7 @@ local obj = {}
 obj.__index = obj
 
 obj.name     = "ClaudeBorder"
-obj.version  = "2.3"
+obj.version  = "2.4"
 obj.author   = "Nikolaj Søgaard Simonsen"
 obj.homepage = "https://github.com/NikolajMosbaek/claude-terminal-borders"
 obj.license  = "MIT - https://opensource.org/licenses/MIT"
@@ -87,9 +87,10 @@ obj.focusHotkey = { { "ctrl", "alt", "cmd" }, "b" }
 obj.pruneInterval = 10
 
 --- ClaudeBorder.tabCacheTTL (Number)
---- Seconds the selected-tab answer is cached. Restacks fire rapidly during a
---- window drag; without the cache each would send its own Apple event.
-obj.tabCacheTTL = 0.3
+--- Minimum seconds between selected-tab refreshes. The answer is refreshed in
+--- the background and restacks read the last one, so this bounds refresh
+--- traffic, not latency; tab-switch events force a refresh regardless.
+obj.tabCacheTTL = 1.0
 
 --- ClaudeBorder.colors (Table)
 --- Maps Claude Code's eight /color names to hex. A raw "#rrggbb" also works
@@ -102,11 +103,13 @@ obj.colors = {
 --- ClaudeBorder.terminalApps (Table)
 --- The terminal applications the Spoon can resolve a tty inside, tried in
 --- order. Each entry supplies the app's name plus three AppleScript templates
---- (`%s` is the tty): `locate` returns {left, top, right, bottom, window name}
---- for the window owning the tty; `selectedTabs` returns the tty of every
---- window's selected tab/pane; `selectTab` makes the tty's tab the selected
---- one. Every script is wrapped in `with timeout` so a busy terminal cannot
---- stall Hammerspoon on the default two-minute Apple-event timeout.
+--- (`%s` is the tty), all returning plain text because they run through an
+--- asynchronous `osascript` (hs.task): a busy terminal answers Apple events
+--- in whole seconds, so nothing script-shaped may ever run on Hammerspoon's
+--- main thread. `locate` returns "left|top|right|bottom|window name" for the
+--- window owning the tty (name last: it may contain anything); `selectedTabs`
+--- returns the tty of every window's selected tab/pane, one per line;
+--- `selectTab` makes the tty's tab the selected one and returns "true".
 ---
 --- Terminal.app is fully supported. iTerm2 is implemented per its scripting
 --- dictionary (sessions inside tabs; the border follows the *active* pane of
@@ -115,27 +118,27 @@ obj.terminalApps = {
   {
     app = "Terminal",
     locate = [[
-      with timeout of 2 seconds
+      with timeout of 5 seconds
         tell application "Terminal"
           repeat with w in windows
             repeat with t in tabs of w
               if tty of t is "%s" then
                 set b to bounds of w
-                return {item 1 of b, item 2 of b, item 3 of b, item 4 of b, name of w}
+                return (item 1 of b as text) & "|" & (item 2 of b as text) & "|" & (item 3 of b as text) & "|" & (item 4 of b as text) & "|" & (name of w)
               end if
             end repeat
           end repeat
         end tell
       end timeout
-      return {}
+      return ""
     ]],
     selectedTabs = [[
-      with timeout of 1 second
+      with timeout of 5 seconds
         tell application "Terminal"
-          set out to {}
+          set out to ""
           repeat with w in windows
             repeat with t in tabs of w
-              if selected of t then set end of out to (tty of t as text)
+              if selected of t then set out to out & (tty of t) & linefeed
             end repeat
           end repeat
           return out
@@ -143,53 +146,53 @@ obj.terminalApps = {
       end timeout
     ]],
     selectTab = [[
-      with timeout of 2 seconds
+      with timeout of 5 seconds
         tell application "Terminal"
           repeat with w in windows
             repeat with t in tabs of w
               if tty of t is "%s" then
                 set selected of t to true
-                return true
+                return "true"
               end if
             end repeat
           end repeat
         end tell
       end timeout
-      return false
+      return "false"
     ]],
   },
   {
     app = "iTerm2",
     locate = [[
-      with timeout of 2 seconds
+      with timeout of 5 seconds
         tell application "iTerm2"
           repeat with w in windows
             repeat with t in tabs of w
               repeat with s in sessions of t
                 if tty of s is "%s" then
                   set b to bounds of w
-                  return {item 1 of b, item 2 of b, item 3 of b, item 4 of b, name of w}
+                  return (item 1 of b as text) & "|" & (item 2 of b as text) & "|" & (item 3 of b as text) & "|" & (item 4 of b as text) & "|" & (name of w)
                 end if
               end repeat
             end repeat
           end repeat
         end tell
       end timeout
-      return {}
+      return ""
     ]],
     selectedTabs = [[
-      with timeout of 1 second
+      with timeout of 5 seconds
         tell application "iTerm2"
-          set out to {}
+          set out to ""
           repeat with w in windows
-            set end of out to (tty of current session of current tab of w as text)
+            set out to out & (tty of current session of current tab of w) & linefeed
           end repeat
           return out
         end tell
       end timeout
     ]],
     selectTab = [[
-      with timeout of 2 seconds
+      with timeout of 5 seconds
         tell application "iTerm2"
           repeat with w in windows
             repeat with t in tabs of w
@@ -197,14 +200,14 @@ obj.terminalApps = {
                 if tty of s is "%s" then
                   tell t to select
                   tell s to select
-                  return true
+                  return "true"
                 end if
               end repeat
             end repeat
           end repeat
         end tell
       end timeout
-      return false
+      return "false"
     ]],
   },
 }
@@ -224,7 +227,8 @@ local enabled    = true   -- the user's master switch (menubar / setEnabled)
 local restacking = false
 local restackDelayed          -- hs.timer.delayed coalescing restack requests
 local wf, appWatcher, spaceWatcher, powerWatcher, pollTimer, pruneTimer
-local bar, hotkeyObj           -- menubar item (present only while waiting), hotkey
+local bar, hotkeyObj           -- persistent menubar item, hotkey
+local scheduleRestack          -- forward: the coalesced-restack scheduler
 
 -- One-shot timers must be retained until they fire: an hs.timer.doAfter whose
 -- return value is dropped can be garbage-collected first and silently never
@@ -244,39 +248,88 @@ local function cancelPending()
   pendingTimers = {}
 end
 
+-- Asynchronous subprocess runner (hs.task), retained until it reports, with a
+-- safety terminate. Injectable (obj._exec) so the test harness can substitute
+-- a synchronous fake.
+--
+-- The stream callback is load-bearing, not an optimization: without one,
+-- hs.task reads stdout only at exit, so a child whose output exceeds the 64KB
+-- pipe buffer (ps -ax on this machine: ~140KB) blocks writing and DEADLOCKS,
+-- and the exit callback never fires.
+local runningTasks = {}
+obj._exec = function(cmd, args, cb)
+  local buf = {}
+  local t
+  t = hs.task.new(cmd, function(code, stdOut, _)
+    runningTasks[t] = nil
+    buf[#buf + 1] = stdOut or ""
+    cb(code == 0, table.concat(buf))
+  end, function(_, stdOut, _)
+    buf[#buf + 1] = stdOut or ""
+    return true
+  end, args)
+  runningTasks[t] = true
+  t:start()
+  after(15, function()
+    if runningTasks[t] then runningTasks[t] = nil; pcall(function() t:terminate() end) end
+  end)
+end
+
+local function cancelTasks()
+  for t in pairs(runningTasks) do pcall(function() t:terminate() end) end
+  runningTasks = {}
+end
+
+-- AppleScript, asynchronously: a Terminal that is busy printing answers Apple
+-- events in whole SECONDS (measured 2-4s per script under load), and the sync
+-- hs.osascript call would stall Hammerspoon's main thread -- menus, timers,
+-- everything -- for exactly that long. This is why every template above
+-- returns plain text: it comes back through osascript's stdout.
+local function runScript(script, cb)
+  obj._exec("/usr/bin/osascript", { "-e", script }, cb)
+end
+
 --------------------------------------------------------------------------------
 -- Window lookup
 --------------------------------------------------------------------------------
 
--- Ask each running terminal app which window owns this tty, and where it is.
+-- Match an AppleScript-reported window position back to an AX window.
 --
 -- Bounds, not title: concurrent Claude windows routinely share a byte-identical
 -- title (same repo, same size, same running command), so matching on title
 -- collapses them all onto whichever window happens to come first.
-local function locateTTY(tty)
-  for _, cfg in ipairs(obj.terminalApps) do
-    if hs.application.get(cfg.app) then
-      local ok, r = hs.osascript.applescript(cfg.locate:format(tty))
-      if ok and r and #r >= 5 then
-        return { left = r[1], top = r[2], title = r[5], app = cfg.app }
-      end
+local function windowMatching(appName, left, top)
+  local app = hs.application.get(appName)
+  if not app then return nil end
+  for _, w in ipairs(app:allWindows()) do
+    local ok, f = pcall(w.frame, w)
+    if ok and f and math.abs(f.x - left) <= 8 and math.abs(f.y - top) <= 8 then
+      return w
     end
   end
   return nil
 end
 
-local function windowForTTY(tty)
-  local loc = locateTTY(tty)
-  if not loc then return nil end
-  local term = hs.application.get(loc.app)
-  if not term then return nil end
-  for _, w in ipairs(term:allWindows()) do
-    local f = w:frame()
-    if math.abs(f.x - loc.left) <= 8 and math.abs(f.y - loc.top) <= 8 then
-      return w, loc.title
-    end
+-- Resolve tty -> (window, title) through each running terminal app in turn.
+-- Asynchronous: cb(win, title) on a hit, cb(nil) when nobody owns the tty.
+local function resolveTTY(tty, cb)
+  local i = 0
+  local function tryNext()
+    i = i + 1
+    local cfg = obj.terminalApps[i]
+    if not cfg then cb(nil); return end
+    if not hs.application.get(cfg.app) then tryNext(); return end
+    runScript(cfg.locate:format(tty), function(ok, out)
+      local l, t = (out or ""):match("^%s*(-?%d+)|(-?%d+)|%-?%d+|%-?%d+|")
+      local title = (out or ""):match("^%s*%-?%d+|%-?%d+|%-?%d+|%-?%d+|([^\n]*)")
+      if ok and l then
+        local win = windowMatching(cfg.app, tonumber(l), tonumber(t))
+        if win then cb(win, title); return end
+      end
+      tryNext()
+    end)
   end
-  return nil
+  tryNext()
 end
 
 local function isTerminalApp(name)
@@ -287,35 +340,66 @@ local function isTerminalApp(name)
 end
 
 -- The set of ttys whose tab/pane is the selected one of its window, across
--- every running terminal app. nil means "could not tell" -- hide nothing.
--- Cached briefly (tabCacheTTL): restacks fire rapidly during window drags.
+-- every running terminal app. Refreshed in the background; restack reads the
+-- last answer (selCache). nil means "no answer yet" -- hide nothing. A
+-- changed answer schedules a restack, so tab switches propagate on their own.
 local selCache, selCacheAt = nil, 0
-local function selectedTTYs()
+local selInFlight = false
+local function refreshSelected(force)
+  if selInFlight then return end
   local now = hs.timer.secondsSinceEpoch()
-  if selCache and (now - selCacheAt) < (obj.tabCacheTTL or 0) then return selCache end
-  local set, answered = {}, false
+  if not force and selCache and (now - selCacheAt) < (obj.tabCacheTTL or 0) then return end
+  local cfgs = {}
   for _, cfg in ipairs(obj.terminalApps) do
-    if cfg.selectedTabs and hs.application.get(cfg.app) then
-      local ok, r = hs.osascript.applescript(cfg.selectedTabs)
-      if ok and type(r) == "table" then
-        answered = true
-        for _, t in ipairs(r) do set[t] = true end
-      end
-    end
+    if cfg.selectedTabs and hs.application.get(cfg.app) then cfgs[#cfgs + 1] = cfg end
   end
-  if not answered then return nil end
-  selCache, selCacheAt = set, now
-  return set
+  if #cfgs == 0 then selCache = nil; return end
+  selInFlight = true
+  local set, remaining, answered = {}, #cfgs, false
+  for _, cfg in ipairs(cfgs) do
+    runScript(cfg.selectedTabs, function(ok, out)
+      if ok then
+        answered = true
+        for line in (out or ""):gmatch("[^\r\n]+") do
+          if line:match("^/dev/") then set[line] = true end
+        end
+      end
+      remaining = remaining - 1
+      if remaining == 0 then
+        selInFlight = false
+        selCacheAt = hs.timer.secondsSinceEpoch()
+        if answered then
+          local changed = selCache == nil
+          if selCache then
+            for k in pairs(set) do if not selCache[k] then changed = true end end
+            for k in pairs(selCache) do if not set[k] then changed = true end end
+          end
+          selCache = set
+          if changed and scheduleRestack then scheduleRestack() end
+        end
+      end
+    end)
+  end
 end
 
-local function selectTab(tty)
-  for _, cfg in ipairs(obj.terminalApps) do
-    if cfg.selectTab and hs.application.get(cfg.app) then
-      local ok, r = hs.osascript.applescript(cfg.selectTab:format(tty))
-      if ok and r == true then selCache = nil; return true end
-    end
+local function selectTab(tty, cb)
+  local i = 0
+  local function tryNext()
+    i = i + 1
+    local cfg = obj.terminalApps[i]
+    if not cfg then if cb then cb(false) end return end
+    if not (cfg.selectTab and hs.application.get(cfg.app)) then tryNext(); return end
+    runScript(cfg.selectTab:format(tty), function(ok, out)
+      if ok and (out or ""):find("true", 1, true) then
+        selCacheAt = 0                -- the answer just changed; refetch soon
+        refreshSelected(true)
+        if cb then cb(true) end
+      else
+        tryNext()
+      end
+    end)
   end
-  return false
+  tryNext()
 end
 
 local function windowId(win)
@@ -518,8 +602,10 @@ local function restack()
 
     -- Two sessions in two tabs of one window would otherwise fight over the
     -- same border: only the selected tab's session shows. The others stay
-    -- tracked (and keep blinking into the menubar) while hidden.
-    local selSet = next(painted) and selectedTTYs() or nil
+    -- tracked (and keep blinking into the menubar) while hidden. The answer
+    -- comes from the background refresh; kick one and read the latest.
+    if next(painted) then refreshSelected() end
+    local selSet = selCache
 
     -- Occluders that carry a border of their own get their punch inflated by
     -- the border width: their own canvas owns that band, and two coloured
@@ -534,8 +620,19 @@ local function restack()
     for tty, rec in pairs(painted) do
       local okF, f = pcall(function() return rec.win and rec.win:frame() end)
       if not okF or not f then
-        local win = windowForTTY(tty)  -- cache stale: re-resolve through Terminal
-        if win then rec.win = win; f = win:frame() else obj:clear(tty); f = nil end
+        -- Cache stale. Hide now; re-resolve in the background (an AppleScript
+        -- round trip) and either rebind the window or release the tty.
+        f = nil
+        rec.onScreen = false
+        updateVisibility(rec)
+        if not rec.resolving then
+          rec.resolving = true
+          resolveTTY(tty, function(win)
+            if painted[tty] ~= rec then return end
+            rec.resolving = false
+            if win then rec.win = win; scheduleRestack() else obj:clear(tty) end
+          end)
+        end
       end
       if f then
         positionCanvas(rec.canvas, f)
@@ -582,7 +679,7 @@ local function restack()
   if not ok then print("ClaudeBorder restack: " .. tostring(err)) end
 end
 
-local function scheduleRestack()
+scheduleRestack = function()
   if not restackDelayed then
     restackDelayed = hs.timer.delayed.new(0.05, restack)
   end
@@ -674,19 +771,31 @@ function obj:paint(tty, color, mode, transcript)
     end
   end
 
-  local win, title = windowForTTY(tty)
-  if not win then return "no window for " .. tostring(tty) end
-  obj:clear(tty)
-  if mode == "blink" and windowId(win) == focusedWindowId() then mode = "solid" end
-  rec = { canvas = drawAround(win, hex or "#000000"), color = hex, win = win,
-          mode = mode, title = title, transcript = transcript }
-  painted[tty] = rec
-  updateVisibility(rec)
-  updateMenubar()
-  if transcript then watchTranscript(rec) end
-  syncBlinkTimer()
-  restack()   -- punch + order the new canvas before its first frame is seen
-  return ("painted %s (%s) %s %s"):format(tty, title, hex or "no colour", rec.mode)
+  -- Fresh claim: the tty->window resolution is an AppleScript round trip, so
+  -- it completes in the background and the border appears when it lands.
+  resolveTTY(tty, function(win, title)
+    if not win then return end
+    if painted[tty] then
+      obj:paint(tty, color, mode, transcript)   -- a hook raced us; update in place
+      return
+    end
+    local m = mode
+    if m == "blink" and windowId(win) == focusedWindowId() then m = "solid" end
+    local fresh = { canvas = drawAround(win, hex or "#000000"), color = hex, win = win,
+                    mode = m, title = title, transcript = transcript }
+    painted[tty] = fresh
+    updateVisibility(fresh)
+    updateMenubar()
+    if transcript then watchTranscript(fresh) end
+    syncBlinkTimer()
+    restack()   -- punch + order the new canvas before its first frame is seen
+  end)
+  rec = painted[tty]   -- already set when the resolver completed synchronously
+  if rec then
+    return ("painted %s (%s) %s %s"):format(tty, rec.title or "?",
+                                            rec.color or "no colour", rec.mode)
+  end
+  return "resolving " .. tty
 end
 
 --- ClaudeBorder:mode(tty, mode) -> string
@@ -741,8 +850,8 @@ end
 function obj:focus(tty)
   local rec = painted[tty]
   if not rec then return "not painted: " .. tostring(tty) end
-  pcall(function() selectTab(tty) end)
-  pcall(function() rec.win:focus() end)
+  pcall(function() rec.win:focus() end)   -- instant; the tab select follows
+  selectTab(tty)                          -- async, refreshes the tab cache too
   if rec.mode == "blink" then obj:mode(tty, "solid") end
   scheduleRestack()
   return "focused " .. tty
@@ -772,23 +881,23 @@ end
 --- ClaudeBorder:prune() -> string
 --- Clear every border whose tty no longer hosts a live claude process.
 --- SessionEnd only fires on a clean exit; this catches crashes and kills.
---- Runs every `pruneInterval` seconds.
+--- Runs every `pruneInterval` seconds; the ps runs asynchronously.
 function obj:prune()
   if not next(painted) then return "pruned 0" end
-  local out = hs.execute("ps -axo tty=,comm=") or ""
-  if not out:find("%S") then return "pruned 0 (ps gave nothing)" end   -- never clear on a failed ps
-  local live = {}
-  for line in out:gmatch("[^\n]+") do
-    local t, comm = line:match("^%s*(%S+)%s+(.+)$")
-    if t and comm and comm:lower():find("claude", 1, true) then
-      live["/dev/" .. t] = true
+  obj._exec("/bin/ps", { "-axo", "tty=,comm=" }, function(ok, out)
+    if not ok or not out:find("%S") then return end   -- never clear on a failed ps
+    local live = {}
+    for line in out:gmatch("[^\n]+") do
+      local t, comm = line:match("^%s*(%S+)%s+(.+)$")
+      if t and comm and comm:lower():find("claude", 1, true) then
+        live["/dev/" .. t] = true
+      end
     end
-  end
-  local n = 0
-  for tty in pairs(painted) do
-    if not live[tty] then obj:clear(tty); n = n + 1 end
-  end
-  return ("pruned %d"):format(n)
+    for tty in pairs(painted) do
+      if not live[tty] then obj:clear(tty) end
+    end
+  end)
+  return "prune requested"
 end
 
 --- ClaudeBorder:rescan() -> string
@@ -804,29 +913,39 @@ function obj:rescan()
   local home = os.getenv("HOME")
   local dir = home .. "/.claude/sessions"
   if not hs.fs.attributes(dir) then return "no session directory" end
-  local n = 0
+  local sessions = {}
   for file in hs.fs.dir(dir) do
     if file:match("^%d+%.json$") then
       local okRead, s = pcall(hs.json.read, dir .. "/" .. file)
       if okRead and s and s.pid and s.sessionId and s.cwd then
-        -- Alive, still a claude process (pids get recycled), and on a real tty.
-        local out = hs.execute(("ps -o tty=,comm= -p %d 2>/dev/null"):format(s.pid)) or ""
-        local t, comm = out:match("^%s*(%S+)%s+(%S+)")
-        if t and t ~= "??" and comm and comm:lower():find("claude", 1, true)
-           and not painted["/dev/" .. t] then
-          local slug = s.cwd:gsub("[^%w]", "-")
-          local transcript = ("%s/.claude/projects/%s/%s.jsonl"):format(home, slug, s.sessionId)
-          if not hs.fs.attributes(transcript) then transcript = nil end
-          local color = transcript and lastColorIn(transcript) or nil
-          local mode = (s.status == "busy") and "solid" or "blink"
-          if obj:paint("/dev/" .. t, color, mode, transcript):match("^painted") then
-            n = n + 1
-          end
-        end
+        sessions[#sessions + 1] = s
       end
     end
   end
-  return ("rescan painted %d session(s)"):format(n)
+  if #sessions == 0 then return "rescan: no sessions" end
+  -- One async ps maps pid -> tty and confirms each is still a claude process
+  -- (pids get recycled); the paints then resolve their windows themselves.
+  obj._exec("/bin/ps", { "-axo", "pid=,tty=,comm=" }, function(ok, out)
+    if not ok then return end
+    local ttyOf = {}
+    for line in out:gmatch("[^\n]+") do
+      local pid, t, comm = line:match("^%s*(%d+)%s+(%S+)%s+(.+)$")
+      if pid and comm and comm:lower():find("claude", 1, true) then
+        ttyOf[tonumber(pid)] = t
+      end
+    end
+    for _, s in ipairs(sessions) do
+      local t = ttyOf[s.pid]
+      if t and t ~= "??" and not painted["/dev/" .. t] then
+        local slug = s.cwd:gsub("[^%w]", "-")
+        local transcript = ("%s/.claude/projects/%s/%s.jsonl"):format(home, slug, s.sessionId)
+        if not hs.fs.attributes(transcript) then transcript = nil end
+        local color = transcript and lastColorIn(transcript) or nil
+        obj:paint("/dev/" .. t, color, (s.status == "busy") and "solid" or "blink", transcript)
+      end
+    end
+  end)
+  return ("rescan: checking %d session(s)"):format(#sessions)
 end
 
 --- ClaudeBorder:restack() -> string
@@ -901,7 +1020,7 @@ function obj:start()
     hs.window.filter.windowUnfocused,
     -- A tab switch usually renames the window; the 2s poll catches the rest.
     hs.window.filter.windowTitleChanged,
-  }, function(win)
+  }, function(win, _, event)
     -- Keep the border glued to its window during a drag, without waiting for
     -- the coalesced restack.
     local id = windowId(win)
@@ -913,6 +1032,8 @@ function obj:start()
         end
       end
     end
+    -- A title change usually means a tab switch: refetch the selected tabs.
+    if event == hs.window.filter.windowTitleChanged then selCacheAt = 0 end
     scheduleRestack()
   end)
 
@@ -1032,6 +1153,7 @@ function obj:stop()
   if blinkTimer then blinkTimer:stop(); blinkTimer = nil end
   if restackDelayed then restackDelayed:stop() end
   cancelPending()
+  cancelTasks()
   return self
 end
 

@@ -39,36 +39,47 @@ local ttyWin = { ["/dev/ttyTEST_A"] = winA, ["/dev/ttyTEST_B"] = winB }
 
 local selStub = nil     -- nil = every fake tty's tab is the selected one
 local selectLog = {}    -- ttys whose tab a selectTab script targeted
+local psStub = nil      -- stdout of the fake /bin/ps
 hs.window.orderedWindows = function() return orderedStub end
 hs.window.focusedWindow = function() return nil end
-hs.osascript.applescript = function(script)
-  -- selectTab script (Terminal: "set selected of t"; iTerm2: "tell t to select")
+
+-- Synchronous stand-in for the spoon's async subprocess runner (obj._exec):
+-- callbacks run inline, so the async paint/prune/refresh flows complete
+-- before the assertions that follow them.
+local function fakeExec(cmd, args, cb)
+  if cmd == "/bin/ps" then cb(true, psStub or ""); return end
+  if cmd ~= "/usr/bin/osascript" then cb(false, ""); return end
+  local script = args[2] or ""
+  -- selectTab (Terminal: "set selected of t"; iTerm2: "tell t to select")
   if script:find("set selected of t to true", 1, true)
      or script:find("tell t to select", 1, true) then
     for tty in pairs(ttyWin) do
       if script:find(tty, 1, true) then
         selectLog[#selectLog + 1] = tty
-        return true, true
+        cb(true, "true\n"); return
       end
     end
-    return true, false
+    cb(true, "false\n"); return
   end
   -- selectedTabs query
   if script:find("if selected of t", 1, true)
      or script:find("current session of current tab", 1, true) then
-    if selStub then return true, selStub end
-    local all = {}
-    for tty in pairs(ttyWin) do all[#all + 1] = tty end
-    return true, all
+    local list = selStub
+    if not list then
+      list = {}
+      for tty in pairs(ttyWin) do list[#list + 1] = tty end
+    end
+    cb(true, table.concat(list, "\n") .. "\n"); return
   end
   -- locate
   for tty, w in pairs(ttyWin) do
     if script:find(tty, 1, true) then
       local f = w.frame()
-      return true, { f.x, f.y, f.x + f.w, f.y + f.h, "stub " .. tty }
+      cb(true, ("%d|%d|%d|%d|stub %s\n"):format(f.x, f.y, f.x + f.w, f.y + f.h, tty))
+      return
     end
   end
-  return true, {}
+  cb(true, "\n")
 end
 hs.application.get = function(name)
   if name ~= "Terminal" then return nil end
@@ -90,6 +101,7 @@ local ok, err = pcall(function()
   dev.menubar = false      -- keep the test run out of the real menubar
   dev.tabCacheTTL = 0      -- selected-tab answers must not be cached mid-test
   dev.settingsKey = "ClaudeBorderTest.enabled"   -- never touch the real toggle
+  dev._exec = fakeExec     -- all subprocess work goes through the fake, inline
   local W = dev.width      -- 5
   local R = dev.radius     -- 11
 
@@ -213,15 +225,17 @@ local ok, err = pcall(function()
         tostring(cA:isShowing()) .. "/" .. tostring(cB:isShowing()))
 
   -- prune() clears ttys with no live claude; a failed ps clears nothing.
-  hs.execute = function() return "" end
-  check("prune on failed ps clears nothing", dev:prune():find("pruned 0") ~= nil, dev:prune())
-  hs.execute = function() return " ttyTEST_A  claude\n ??        loginwindow\n" end
-  local pres = dev:prune()
-  check("prune clears dead sessions", pres == "pruned 2", pres)
-  check("prune keeps the live session",
-        dev:list():find("ttyTEST_A") ~= nil
-        and not dev:list():find("ttyTEST_B") and not dev:list():find("ttyTEST_C"), dev:list())
-  hs.execute = realExecute
+  psStub = ""
+  dev:prune()
+  check("prune on failed ps clears nothing",
+        dev:list():find("ttyTEST_A", 1, true) ~= nil
+        and dev:list():find("ttyTEST_B", 1, true) ~= nil, dev:list())
+  psStub = " ttyTEST_A  claude\n ??        loginwindow\n"
+  dev:prune()
+  check("prune clears dead sessions",
+        not dev:list():find("ttyTEST_B") and not dev:list():find("ttyTEST_C"), dev:list())
+  check("prune keeps the live session", dev:list():find("ttyTEST_A", 1, true) ~= nil, dev:list())
+  psStub = nil
 
   -- clear() releases everything.
   dev:clearAll()

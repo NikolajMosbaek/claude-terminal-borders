@@ -126,8 +126,20 @@ it — via the menu or ⌃⌥⌘B — selects its tab before focusing the window
 iTerm2 the border follows the *active pane* of a split.
 
 The terminal apps searched (and their AppleScript) live in
-`ClaudeBorder.terminalApps`; every script is wrapped in `with timeout` so a
-busy terminal can't stall Hammerspoon.
+`ClaudeBorder.terminalApps`.
+
+### Nothing blocks
+
+A Terminal that is busy printing answers Apple events in whole seconds — and
+Claude sessions print constantly, so that is the normal case, and one
+synchronous AppleScript call per restack made the whole of Hammerspoon (menus
+included) feel laggy. Every subprocess therefore runs asynchronously
+(`hs.task`): tty→window resolution, the selected-tab query (cached, refreshed
+in the background; restacks read the last answer), tab selection, and the
+prune's `ps`. The scripts return plain text on stdout, and the task runner
+reads it with a **streaming callback — without one, hs.task collects stdout
+only at exit, so any child whose output exceeds the 64KB pipe buffer (`ps
+-ax…` here is ~140KB) deadlocks and its callback never fires.**
 
 ### Menubar item & hotkey
 
