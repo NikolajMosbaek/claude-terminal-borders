@@ -4,7 +4,9 @@
 --- concurrent Claude Code sessions are distinguishable at a glance.
 ---
 --- A border is claimed by a tty, coloured from that session's `/color`, and
---- blinks while Claude is waiting for input.
+--- blinks while Claude is waiting for input. Borders are occlusion-aware: the
+--- parts covered by windows above are punched out, so a border reads as glued
+--- to its window instead of floating over everything.
 ---
 --- Download: https://github.com/NikolajMosbaek/claude-terminal-borders
 
@@ -12,7 +14,7 @@ local obj = {}
 obj.__index = obj
 
 obj.name     = "ClaudeBorder"
-obj.version  = "1.0"
+obj.version  = "2.0"
 obj.author   = "Nikolaj Søgaard Simonsen"
 obj.homepage = "https://github.com/NikolajMosbaek/claude-terminal-borders"
 obj.license  = "MIT - https://opensource.org/licenses/MIT"
@@ -38,13 +40,25 @@ obj.blinkInterval = 0.55
 obj.dimAlpha = 0.12
 
 --- ClaudeBorder.autoHide (Boolean)
---- Show borders only while Terminal is the active application.
+--- Hide all borders whenever Terminal is not the active application.
 ---
---- hs.canvas has no window level between "behind my own window" and "above
---- everything", so a border necessarily floats over other applications. Hiding
---- it whenever Terminal is not frontmost sidesteps that: a border over another
---- app's window only matters while you are using that app.
-obj.autoHide = true
+--- Off by default: occlusion clipping already removes the parts of a border
+--- that other windows cover, so borders stay correct while you work in another
+--- app. Turn it on to reclaim the pre-2.0 behaviour of no borders at all
+--- outside Terminal.
+obj.autoHide = false
+
+--- ClaudeBorder.rescanOnStart (Boolean)
+--- Rebuild borders for already-running Claude Code sessions when the Spoon
+--- starts, from ~/.claude/sessions/. Without this a Hammerspoon restart leaves
+--- every existing window bare until its session's next hook fires.
+obj.rescanOnStart = true
+
+--- ClaudeBorder.zPollInterval (Number)
+--- Seconds between safety-net restacks. Most z-order changes arrive as window
+--- events; this catches the ones that fire no event (a window raised without
+--- focus, an app un-hidden behind another). 0 disables the poll.
+obj.zPollInterval = 2.0
 
 --- ClaudeBorder.colors (Table)
 --- Maps Claude Code's eight /color names to hex. A raw "#rrggbb" also works
@@ -62,10 +76,12 @@ obj.colors = {
 -- Internal state
 --------------------------------------------------------------------------------
 
-local painted   = {}      -- [tty] = { canvas, color, mode, timer, win, title, transcript, watcher }
-local shown     = true
-local reflowing = false
-local wf, appWatcher
+local painted    = {}     -- [tty] = { canvas, color, mode, timer, win, title,
+                          --           transcript, watcher, onScreen, holeKey }
+local shown      = true
+local restacking = false
+local restackDelayed          -- hs.timer.delayed coalescing restack requests
+local wf, appWatcher, spaceWatcher, powerWatcher, pollTimer
 
 --------------------------------------------------------------------------------
 -- Window lookup
@@ -109,6 +125,22 @@ local function windowForTTY(tty)
   return nil
 end
 
+local function windowId(win)
+  if not win then return nil end
+  local ok, id = pcall(win.id, win)
+  if ok then return id end
+  return nil
+end
+
+local function focusedWindowId()
+  local ok, id = pcall(function()
+    local w = hs.window.focusedWindow()
+    return w and w:id() or nil
+  end)
+  if ok then return id end
+  return nil
+end
+
 --------------------------------------------------------------------------------
 -- Drawing
 --------------------------------------------------------------------------------
@@ -136,7 +168,6 @@ local function drawAround(win, hex)
   c:level(hs.canvas.windowLevels.floating)
   c:behavior(hs.canvas.windowBehaviors.canJoinAllSpaces)
   c:clickActivating(false)
-  c:show()
   return c
 end
 
@@ -151,6 +182,135 @@ local function startBlink(rec)
       rec.canvas:alpha(rec.canvas:alpha() > 0.5 and obj.dimAlpha or 1.0)
     end
   end)
+end
+
+-- A border is drawn only when the session has a colour AND its window is
+-- actually visible (on the current Space, not minimized, app not hidden) AND
+-- borders are globally shown.
+local function updateVisibility(rec)
+  if shown and rec.color and rec.onScreen ~= false then
+    rec.canvas:show()
+  else
+    rec.canvas:hide()
+  end
+end
+
+--------------------------------------------------------------------------------
+-- Occlusion
+--
+-- hs.canvas has no window level between "behind my own window" and "above
+-- everything", so the canvas necessarily floats over every ordinary window.
+-- Instead of hiding borders (the pre-2.0 autoHide workaround), punch out the
+-- parts of each border that a window above it covers: element 1 is the stroke,
+-- every following element is a compositeRule="clear" rectangle over an
+-- occluding window. The punch mirrors the occluder's rounded corners, so the
+-- border appears to slide *under* its neighbours.
+--------------------------------------------------------------------------------
+
+local function applyPunches(rec, holes, key)
+  if rec.holeKey == key then return end   -- unchanged since last restack
+  rec.holeKey = key
+  local c = rec.canvas
+  while #c > 1 do c:removeElement(#c) end
+  for _, h in ipairs(holes) do
+    c:appendElements({
+      type             = "rectangle",
+      action           = "fill",
+      compositeRule    = "clear",
+      frame            = { x = h.x, y = h.y, w = h.w, h = h.h },
+      roundedRectRadii = { xRadius = h.r, yRadius = h.r },
+    })
+  end
+end
+
+-- One pass over everything: refresh window handles, reposition canvases, punch
+-- occluded regions, mirror window z-order onto the canvases, apply visibility.
+--
+-- Never called directly from a window-event handler -- always through
+-- scheduleRestack(), whose delayed timer runs outside the handler. Calling
+-- canvas:show() from inside a window-event handler re-triggers window events
+-- and overflows the Lua stack.
+local function restack()
+  if restacking then return end
+  restacking = true
+
+  local ok, err = pcall(function()
+    local ordered = hs.window.orderedWindows() or {}   -- front to back, all apps
+    local zOf, ids, frames = {}, {}, {}
+    for i, w in ipairs(ordered) do
+      local id = windowId(w)
+      if id then
+        zOf[id], ids[i] = i, id
+        local okF, f = pcall(w.frame, w)
+        if okF then frames[i] = f end
+      end
+    end
+
+    -- Occluders that carry a border of their own get their punch inflated by
+    -- the border width: their own canvas owns that band, and two coloured
+    -- strokes crossing each other read as noise.
+    local borderedIds = {}
+    for _, rec in pairs(painted) do
+      local id = windowId(rec.win)
+      if id and rec.color then borderedIds[id] = true end
+    end
+
+    local byZ = {}   -- recs visible on this Space, for canvas ordering
+    for tty, rec in pairs(painted) do
+      local okF, f = pcall(function() return rec.win and rec.win:frame() end)
+      if not okF or not f then
+        local win = windowForTTY(tty)  -- cache stale: re-resolve through Terminal
+        if win then rec.win = win; f = win:frame() else obj:clear(tty); f = nil end
+      end
+      if f then
+        positionCanvas(rec.canvas, f)
+        local z = zOf[windowId(rec.win)]
+        rec.onScreen = z ~= nil
+        if z then
+          byZ[#byZ + 1] = { z = z, rec = rec }
+          local w = obj.width
+          local cf = { x = f.x - w, y = f.y - w, w = f.w + w * 2, h = f.h + w * 2 }
+          local holes, key = {}, ""
+          for i = 1, z - 1 do
+            local of = frames[i]
+            if of then
+              local pad = borderedIds[ids[i]] and w or 0
+              local px, py = of.x - pad, of.y - pad
+              local pw, ph = of.w + pad * 2, of.h + pad * 2
+              if px < cf.x + cf.w and px + pw > cf.x and
+                 py < cf.y + cf.h and py + ph > cf.y then
+                -- Keep the occluder's full rect (the canvas clips it) so the
+                -- punch's rounded corners land where the window's do.
+                local hx, hy = px - cf.x, py - cf.y
+                holes[#holes + 1] = { x = hx, y = hy, w = pw, h = ph, r = obj.radius + pad }
+                key = key .. ("|%d,%d,%d,%d,%d"):format(hx, hy, pw, ph, pad)
+              end
+            end
+          end
+          applyPunches(rec, holes, key)
+        end
+        updateVisibility(rec)
+      end
+    end
+
+    -- Raise canvases back-to-front so their stacking mirrors the windows':
+    -- the frontmost window's border ends up on top of its neighbours'.
+    -- Only visible ones: orderAbove() un-hides a hidden canvas.
+    table.sort(byZ, function(a, b) return a.z > b.z end)
+    for _, e in ipairs(byZ) do
+      if e.rec.canvas:isShowing() then e.rec.canvas:orderAbove() end
+    end
+  end)
+
+  restacking = false
+  if not ok then print("ClaudeBorder restack: " .. tostring(err)) end
+end
+
+local function scheduleRestack()
+  if not restackDelayed then
+    restackDelayed = hs.timer.delayed.new(0.05, restack)
+  end
+  restackDelayed:start()
 end
 
 --------------------------------------------------------------------------------
@@ -171,13 +331,15 @@ local function lastColorIn(path)
   local chunk = f:read("*a") or ""
   f:close()
   local last
-  for c in chunk:gmatch('"agentColor":"(%a+)"') do last = c end
+  for c in chunk:gmatch('"agentColor":"([^"]+)"') do last = c end
   return last
 end
 
--- A border is drawn only when the session has a colour AND borders are showing.
-local function updateVisibility(rec)
-  if shown and rec.color then rec.canvas:show() else rec.canvas:hide() end
+-- A /color name, or a raw #rrggbb, to hex. nil in (or an unknown name, or
+-- "default") means "no colour" -- nil out.
+local function resolveHex(color)
+  if not color then return nil end
+  return obj.colors[color] or color:match("^#%x%x%x%x%x%x$") or nil
 end
 
 -- hex may be nil, meaning "/color has not been run" -- draw nothing.
@@ -192,8 +354,7 @@ local function watchTranscript(rec)
   if rec.watcher then rec.watcher:stop(); rec.watcher = nil end
   if not rec.transcript then return end
   local debounced = hs.timer.delayed.new(1.0, function()
-    local name = lastColorIn(rec.transcript)
-    applyColor(rec, name and obj.colors[name] or nil)
+    applyColor(rec, resolveHex(lastColorIn(rec.transcript)))
   end)
   rec.watcher = hs.pathwatcher.new(rec.transcript, function() debounced:start() end)
   rec.watcher:start()
@@ -208,25 +369,55 @@ end
 --- Claim the Terminal window owning `tty`. `mode` is "solid" (default) or
 --- "blink". Passing the session's transcript path keeps the colour in sync with
 --- /color without waiting for a hook.
+---
+--- A tty that is already painted and whose window is still alive is updated in
+--- place -- hooks call this on every prompt, and a delete-and-recreate per turn
+--- flickers. The canvas is only rebuilt when the window has to be re-resolved.
+---
+--- "blink" on the window you are focused on right now downgrades to "solid":
+--- you are already looking at it, and a click on an already-focused window
+--- fires no focus event, so nothing would ever stop the blink.
 function obj:paint(tty, color, mode, transcript)
-  local hex = obj.colors[color] or (color and color:match("^#%x%x%x%x%x%x$")) or nil
+  local hex = resolveHex(color)
+  mode = mode or "solid"
+
+  local rec = painted[tty]
+  if rec then
+    local alive = pcall(function() return rec.win:frame().w end)
+    if alive then
+      applyColor(rec, hex)
+      if rec.transcript ~= transcript then
+        rec.transcript = transcript
+        watchTranscript(rec)
+      end
+      obj:mode(tty, mode)
+      scheduleRestack()
+      return ("painted %s (%s) %s %s (updated)"):format(
+        tty, rec.title or "?", hex or "no colour", rec.mode)
+    end
+  end
+
   local win, title = windowForTTY(tty)
   if not win then return "no window for " .. tostring(tty) end
   obj:clear(tty)
-  local rec = { canvas = drawAround(win, hex or "#000000"), color = hex, win = win,
-                mode = mode or "solid", title = title, transcript = transcript }
+  if mode == "blink" and windowId(win) == focusedWindowId() then mode = "solid" end
+  rec = { canvas = drawAround(win, hex or "#000000"), color = hex, win = win,
+          mode = mode, title = title, transcript = transcript }
   painted[tty] = rec
   updateVisibility(rec)
   if transcript then watchTranscript(rec) end
   if rec.mode == "blink" then startBlink(rec) end
+  restack()   -- punch + order the new canvas before its first frame is seen
   return ("painted %s (%s) %s %s"):format(tty, title, hex or "no colour", rec.mode)
 end
 
 --- ClaudeBorder:mode(tty, mode) -> string
 --- Switch an existing border between "solid" and "blink" without redrawing.
+--- The same already-focused downgrade as `paint` applies.
 function obj:mode(tty, mode)
   local rec = painted[tty]
   if not rec then return "not painted: " .. tostring(tty) end
+  if mode == "blink" and windowId(rec.win) == focusedWindowId() then mode = "solid" end
   rec.mode = mode
   if mode == "blink" then
     startBlink(rec)
@@ -266,6 +457,52 @@ function obj:list()
   return table.concat(out, "\n")
 end
 
+--- ClaudeBorder:rescan() -> string
+--- Rebuild borders for Claude Code sessions that are already running, from
+--- ~/.claude/sessions/<pid>.json (pid, sessionId, cwd, status). Runs on
+--- :start() by default (see `rescanOnStart`) and again on screen unlock;
+--- SessionStart only fires for new sessions, so without this a Hammerspoon
+--- restart leaves existing windows bare until their next turn.
+---
+--- Idempotent: a tty that already has a border is left exactly as it is, so
+--- an unlock-triggered rescan never clobbers a live border's colour or mode.
+function obj:rescan()
+  local home = os.getenv("HOME")
+  local dir = home .. "/.claude/sessions"
+  if not hs.fs.attributes(dir) then return "no session directory" end
+  local n = 0
+  for file in hs.fs.dir(dir) do
+    if file:match("^%d+%.json$") then
+      local okRead, s = pcall(hs.json.read, dir .. "/" .. file)
+      if okRead and s and s.pid and s.sessionId and s.cwd then
+        -- Alive, still a claude process (pids get recycled), and on a real tty.
+        local out = hs.execute(("ps -o tty=,comm= -p %d 2>/dev/null"):format(s.pid)) or ""
+        local t, comm = out:match("^%s*(%S+)%s+(%S+)")
+        if t and t ~= "??" and comm and comm:lower():find("claude", 1, true)
+           and not painted["/dev/" .. t] then
+          local slug = s.cwd:gsub("[^%w]", "-")
+          local transcript = ("%s/.claude/projects/%s/%s.jsonl"):format(home, slug, s.sessionId)
+          if not hs.fs.attributes(transcript) then transcript = nil end
+          local color = transcript and lastColorIn(transcript) or nil
+          local mode = (s.status == "busy") and "solid" or "blink"
+          if obj:paint("/dev/" .. t, color, mode, transcript):match("^painted") then
+            n = n + 1
+          end
+        end
+      end
+    end
+  end
+  return ("rescan painted %d session(s)"):format(n)
+end
+
+--- ClaudeBorder:restack() -> string
+--- Force an immediate occlusion/visibility/z-order pass. Normally not needed:
+--- window events, Space switches, unlocks and the safety poll all schedule one.
+function obj:restack()
+  restack()
+  return "restacked"
+end
+
 --- ClaudeBorder:setVisible(bool) -> string
 function obj:setVisible(v)
   shown = v
@@ -276,7 +513,12 @@ end
 --- ClaudeBorder:setAutoHide(bool) -> string
 function obj:setAutoHide(v)
   obj.autoHide = v
-  if not v then obj:setVisible(true) end
+  if v then
+    local front = hs.application.frontmostApplication()
+    obj:setVisible(front ~= nil and front:name() == "Terminal")
+  else
+    obj:setVisible(true)
+  end
   return "autohide=" .. tostring(obj.autoHide)
 end
 
@@ -284,59 +526,97 @@ end
 -- Lifecycle
 --------------------------------------------------------------------------------
 
-local function reflow()
-  if reflowing then return end       -- canvas ops can re-enter this
-  reflowing = true
-  for tty, rec in pairs(painted) do
-    local ok, f = pcall(function() return rec.win and rec.win:frame() end)
-    if not ok or not f then
-      local win = windowForTTY(tty)  -- cache stale: re-resolve through Terminal
-      if win then rec.win = win; f = win:frame() end
-    end
-    if f then positionCanvas(rec.canvas, f) else obj:clear(tty) end
-  end
-  reflowing = false
-end
-
 --- ClaudeBorder:start() -> self
 function obj:start()
   require("hs.ipc")   -- enables the `hs` command line tool
 
-  wf = hs.window.filter.new("Terminal")
+  -- All apps, not just Terminal: any window can occlude a border, so any
+  -- window's move/close/raise must trigger a restack. Hammerspoon's own
+  -- windows are rejected so canvas frame changes can never feed back in.
+  wf = hs.window.filter.new():setAppFilter("Hammerspoon", false)
   obj._wf = wf        -- retained: a collected filter silently drops subscriptions
 
   -- windowMoved also covers resizes; hs.window.filter has no windowResized.
+  -- The handler only repositions (element/frame writes, no show/hide) and
+  -- schedules the real work: restack() runs from the delayed timer, outside
+  -- the handler, where canvas:show() is safe.
   wf:subscribe({
-    hs.window.filter.windowMoved,
+    hs.window.filter.windowCreated,
     hs.window.filter.windowDestroyed,
+    hs.window.filter.windowMoved,
     hs.window.filter.windowMinimized,
     hs.window.filter.windowUnminimized,
-  }, reflow)
-
-  -- Focusing a window means you have seen it, so stop its blink without waiting
-  -- for a prompt. Safe here because :mode() only stops a timer and sets alpha.
-  -- Calling canvas:show() from a window-event handler re-triggers window events
-  -- and overflows the Lua stack -- do not add one.
-  wf:subscribe(hs.window.filter.windowFocused, function(win)
-    if not win then return end
-    local okId, focusedId = pcall(function() return win:id() end)
-    if not okId then return end
-    for tty, rec in pairs(painted) do
-      if rec.mode == "blink" and rec.win then
-        local ok, id = pcall(function() return rec.win:id() end)
-        if ok and id == focusedId then obj:mode(tty, "solid") end
+    hs.window.filter.windowHidden,
+    hs.window.filter.windowUnhidden,
+    hs.window.filter.windowFullscreened,
+    hs.window.filter.windowUnfullscreened,
+    hs.window.filter.windowUnfocused,
+  }, function(win)
+    -- Keep the border glued to its window during a drag, without waiting for
+    -- the coalesced restack.
+    local id = windowId(win)
+    if id then
+      for _, rec in pairs(painted) do
+        if windowId(rec.win) == id then
+          local okF, f = pcall(win.frame, win)
+          if okF and f then positionCanvas(rec.canvas, f) end
+        end
       end
     end
+    scheduleRestack()
   end)
 
-  -- App activation, deliberately not window focus, for the show/hide channel.
+  -- Focusing a window means you have seen it, so stop its blink without
+  -- waiting for a prompt. A raise always accompanies focus, so restack too.
+  wf:subscribe(hs.window.filter.windowFocused, function(win)
+    local focusedId = windowId(win)
+    if focusedId then
+      for tty, rec in pairs(painted) do
+        if rec.mode == "blink" and windowId(rec.win) == focusedId then
+          obj:mode(tty, "solid")
+        end
+      end
+    end
+    scheduleRestack()
+  end)
+
+  -- App activation changes z-order wholesale; it is also the autoHide channel.
   appWatcher = hs.application.watcher.new(function(name, event)
-    if obj.autoHide and event == hs.application.watcher.activated then
-      obj:setVisible(name == "Terminal")
+    if event == hs.application.watcher.activated then
+      if obj.autoHide then obj:setVisible(name == "Terminal") end
+      scheduleRestack()
     end
   end)
   appWatcher:start()
   obj._appWatcher = appWatcher
+
+  -- Space switches change which windows exist without any window event.
+  spaceWatcher = hs.spaces.watcher.new(scheduleRestack)
+  spaceWatcher:start()
+  obj._spaceWatcher = spaceWatcher
+
+  -- A locked screen degrades the Accessibility API system-wide: windows
+  -- enumerate but report no frames, so any paint attempted while locked fails
+  -- with "no window". Rescan (idempotent) once the session is usable again.
+  powerWatcher = hs.caffeinate.watcher.new(function(event)
+    if event == hs.caffeinate.watcher.screensDidUnlock
+       or event == hs.caffeinate.watcher.sessionDidBecomeActive
+       or event == hs.caffeinate.watcher.systemDidWake then
+      hs.timer.doAfter(2, function() obj:rescan() end)
+      scheduleRestack()
+    end
+  end)
+  powerWatcher:start()
+  obj._powerWatcher = powerWatcher
+
+  -- Safety net for z-order changes that fire no event. restack() is a no-op
+  -- redraw-wise when nothing changed (holeKey), so this is cheap.
+  if obj.zPollInterval and obj.zPollInterval > 0 then
+    pollTimer = hs.timer.doEvery(obj.zPollInterval, function()
+      if next(painted) then scheduleRestack() end
+    end)
+    obj._pollTimer = pollTimer
+  end
 
   local front = hs.application.frontmostApplication()
   shown = (not obj.autoHide) or (front ~= nil and front:name() == "Terminal")
@@ -357,6 +637,11 @@ function obj:start()
   end)
   hs.urlevent.bind("borderoff", function() obj:clearAll() end)
 
+  if obj.rescanOnStart then
+    -- Deferred so the window filter has warmed up before the first paints.
+    hs.timer.doAfter(0.5, function() obj:rescan() end)
+  end
+
   return self
 end
 
@@ -365,6 +650,10 @@ function obj:stop()
   obj:clearAll()
   if wf then wf:unsubscribeAll(); wf = nil; obj._wf = nil end
   if appWatcher then appWatcher:stop(); appWatcher = nil; obj._appWatcher = nil end
+  if spaceWatcher then spaceWatcher:stop(); spaceWatcher = nil; obj._spaceWatcher = nil end
+  if powerWatcher then powerWatcher:stop(); powerWatcher = nil; obj._powerWatcher = nil end
+  if pollTimer then pollTimer:stop(); pollTimer = nil; obj._pollTimer = nil end
+  if restackDelayed then restackDelayed:stop() end
   return self
 end
 

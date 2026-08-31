@@ -16,6 +16,7 @@ echo "  ~/.hammerspoon/Spoons/ClaudeBorder.spoon"
 echo "  ~/.claude/hooks/claude-border.sh"
 echo
 echo "Add to ~/.hammerspoon/init.lua:"
+echo '  require("hs.ipc")  -- keep the hs CLI alive even if a Spoon fails to load'
 echo '  hs.loadSpoon("ClaudeBorder"):start()'
 echo
 echo "Then merge examples/claude-code-hooks.json into ~/.claude/settings.json,"
