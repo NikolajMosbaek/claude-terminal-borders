@@ -198,7 +198,14 @@ restart therefore no longer leaves existing windows bare.
 
 The unlock rescan matters more than it looks: a **locked screen degrades the
 macOS Accessibility API system-wide** (windows enumerate but report no frames),
-so any border work attempted while locked fails. Everything heals on unlock.
+so any border work attempted while locked fails — and AX often stays degraded
+for a few seconds *after* unlock, so the unlock rescan retries (2/6/15s). A
+window that can't be re-resolved is hidden and retried, never released — a
+failed lookup means "not findable right now", not "gone"; releasing ttys is
+the prune's job. On top of all of that, an idempotent rescan runs every
+`rescanInterval` (60s, skipped while locked), so whatever a lock cycle,
+display change or AX hiccup broke, live sessions get their borders back
+within a minute.
 
 ## iTerm2 disclosure
 
@@ -239,6 +246,7 @@ cb.dimAlpha      = 0.12     -- raise for a gentler pulse
 cb.autoHide      = false    -- true: hide all borders when Terminal isn't frontmost
 cb.rescanOnStart = true     -- rebuild borders for already-running sessions
 cb.zPollInterval = 2.0      -- safety-net restack, seconds; 0 disables
+cb.rescanInterval = 60      -- safety-net rescan, seconds; 0 disables
 cb.menubar       = true     -- menubar item: waiting dots + Enable/Disable toggle
 cb.focusHotkey   = { {"ctrl","alt","cmd"}, "b" }  -- focus next waiting; false disables
 cb.pruneInterval = 10       -- clear borders of dead sessions, seconds; 0 disables

@@ -14,7 +14,7 @@ local obj = {}
 obj.__index = obj
 
 obj.name     = "ClaudeBorder"
-obj.version  = "2.6"
+obj.version  = "2.6.1"
 obj.author   = "Nikolaj Søgaard Simonsen"
 obj.homepage = "https://github.com/NikolajMosbaek/claude-terminal-borders"
 obj.license  = "MIT - https://opensource.org/licenses/MIT"
@@ -59,6 +59,15 @@ obj.rescanOnStart = true
 --- events; this catches the ones that fire no event (a window raised without
 --- focus, an app un-hidden behind another). 0 disables the poll.
 obj.zPollInterval = 2.0
+
+--- ClaudeBorder.rescanInterval (Number)
+--- Seconds between safety-net rescans. Rescan is idempotent (painted ttys are
+--- left alone) and cheap (session files + one async ps), and this makes every
+--- failure mode self-healing: whatever a lock/unlock cycle, display change or
+--- AX hiccup broke, live sessions get their borders back within a minute.
+--- Skipped while the screen is locked -- paints cannot succeed there.
+--- 0 disables.
+obj.rescanInterval = 60
 
 --- ClaudeBorder.menubar (Boolean)
 --- Show a menubar item: one dot per waiting session, in its border colour,
@@ -696,8 +705,13 @@ local function restack(light)
     for tty, rec in pairs(painted) do
       local okF, f = pcall(function() return rec.win and rec.win:frame() end)
       if not okF or not f then
-        -- Cache stale. Hide now; re-resolve in the background (an AppleScript
-        -- round trip) and either rebind the window or release the tty.
+        -- Cache stale. Hide now and re-resolve in the background (an
+        -- AppleScript round trip). A failed resolve means "cannot find it
+        -- RIGHT NOW", not "gone" -- a locked screen zeroes every AX frame, so
+        -- resolving during a lock always fails -- so never clear here: stay
+        -- hidden and let the safety poll retry. A truly dead session is the
+        -- prune's job (its claude is gone), and a closed window kills its
+        -- shell, which is the same thing.
         f = nil
         rec.onScreen = false
         updateVisibility(rec)
@@ -706,7 +720,7 @@ local function restack(light)
           resolveTTY(tty, function(win)
             if painted[tty] ~= rec then return end
             rec.resolving = false
-            if win then rec.win = win; scheduleRestack() else obj:clear(tty) end
+            if win then rec.win = win; scheduleRestack() end
           end)
         end
       end
@@ -1209,11 +1223,15 @@ function obj:start()
   -- A locked screen degrades the Accessibility API system-wide: windows
   -- enumerate but report no frames, so any paint attempted while locked fails
   -- with "no window". Rescan (idempotent) once the session is usable again.
+  -- Retry the unlock rescan: AX is often STILL degraded a couple of seconds
+  -- after unlock, so a single shot can fire into the same wall it is healing.
   powerWatcher = hs.caffeinate.watcher.new(function(event)
     if event == hs.caffeinate.watcher.screensDidUnlock
        or event == hs.caffeinate.watcher.sessionDidBecomeActive
        or event == hs.caffeinate.watcher.systemDidWake then
-      after(2, function() obj:rescan() end)
+      for _, delay in ipairs({ 2, 6, 15 }) do
+        after(delay, function() obj:rescan() end)
+      end
       scheduleRestack()
     end
   end)
@@ -1233,6 +1251,15 @@ function obj:start()
   if obj.pruneInterval and obj.pruneInterval > 0 then
     pruneTimer = hs.timer.doEvery(obj.pruneInterval, function() obj:prune() end)
     obj._pruneTimer = pruneTimer
+  end
+
+  -- Re-adopt any live session that lost its border (idempotent, see
+  -- rescanInterval). Not while locked: no paint can succeed there.
+  if obj.rescanInterval and obj.rescanInterval > 0 then
+    obj._rescanTimer = hs.timer.doEvery(obj.rescanInterval, function()
+      local locked = hs.caffeinate.sessionProperties()["CGSSessionScreenIsLocked"]
+      if not locked then obj:rescan() end
+    end)
   end
 
   -- Jump to the next waiting session from anywhere.
@@ -1288,6 +1315,7 @@ function obj:stop()
   if powerWatcher then powerWatcher:stop(); powerWatcher = nil; obj._powerWatcher = nil end
   if pollTimer then pollTimer:stop(); pollTimer = nil; obj._pollTimer = nil end
   if pruneTimer then pruneTimer:stop(); pruneTimer = nil; obj._pruneTimer = nil end
+  if obj._rescanTimer then obj._rescanTimer:stop(); obj._rescanTimer = nil end
   if hotkeyObj then hotkeyObj:delete(); hotkeyObj = nil; obj._hotkey = nil end
   if bar then bar:delete(); bar = nil end
   if pillCanvas then pillCanvas:delete(); pillCanvas = nil; obj._pill = nil end
