@@ -20,8 +20,9 @@ puts the same colour on the window itself.
 ## Requirements
 
 - macOS 14+
-- **Terminal.app** — iTerm2, Ghostty, kitty and WezTerm are not supported (the
-  tty→window lookup is Terminal-specific AppleScript)
+- **Terminal.app** (fully supported) or **iTerm2** (implemented per its
+  scripting dictionary; less battle-tested). Ghostty, kitty and WezTerm expose
+  no AppleScript and are not supportable — the tty→window lookup needs it.
 - [Hammerspoon](https://www.hammerspoon.org) — `brew install --cask hammerspoon`
 - Claude Code
 
@@ -112,7 +113,21 @@ and skipped, so the steady state costs nothing to redraw.
 Focusing the window stops the blink — you have seen it. A blink requested for
 the window you are **already focused on** is downgraded to solid for the same
 reason (and because clicking an already-focused window fires no focus event,
-nothing would ever have stopped it).
+nothing would ever have stopped it). All blinking borders share one timer, so
+they pulse in phase.
+
+### Tabs
+
+Two Claude sessions in two tabs of one window share one window frame, so only
+the **selected tab's** session shows its border; switch tabs and the border
+switches with you (within `tabCacheTTL`, plus the title-change event or the 2s
+poll). A background-tab session keeps blinking into the menubar, and focusing
+it — via the menu or ⌃⌥⌘B — selects its tab before focusing the window. In
+iTerm2 the border follows the *active pane* of a split.
+
+The terminal apps searched (and their AppleScript) live in
+`ClaudeBorder.terminalApps`; every script is wrapped in `with timeout` so a
+busy terminal can't stall Hammerspoon.
 
 ### Waiting indicator & hotkey
 
@@ -177,6 +192,7 @@ cb.zPollInterval = 2.0      -- safety-net restack, seconds; 0 disables
 cb.menubar       = true     -- dots in the menubar while sessions are waiting
 cb.focusHotkey   = { {"ctrl","alt","cmd"}, "b" }  -- focus next waiting; false disables
 cb.pruneInterval = 10       -- clear borders of dead sessions, seconds; 0 disables
+cb.tabCacheTTL   = 0.3      -- seconds the selected-tab answer is cached
 cb.colors.green  = "#32d74b"
 cb:start()
 ```
@@ -214,7 +230,7 @@ open -g "hammerspoon://border?tty=/dev/ttys001&color=off"
 ./test/run.sh
 ```
 
-Runs a headless suite (37 checks) against the **installed** spoon inside the
+Runs a headless suite (41 checks) against the **installed** spoon inside the
 live Hammerspoon: the AX/AppleScript layer is stubbed with fake windows, so
 occlusion punching, visibility, z-ordering, blink and the in-place repaint are
 verified numerically — it even works with the screen locked.

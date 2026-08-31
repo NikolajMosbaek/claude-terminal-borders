@@ -37,9 +37,31 @@ local orderedStub = { winPlain, winA, winB }
 
 local ttyWin = { ["/dev/ttyTEST_A"] = winA, ["/dev/ttyTEST_B"] = winB }
 
+local selStub = nil     -- nil = every fake tty's tab is the selected one
+local selectLog = {}    -- ttys whose tab a selectTab script targeted
 hs.window.orderedWindows = function() return orderedStub end
 hs.window.focusedWindow = function() return nil end
 hs.osascript.applescript = function(script)
+  -- selectTab script (Terminal: "set selected of t"; iTerm2: "tell t to select")
+  if script:find("set selected of t to true", 1, true)
+     or script:find("tell t to select", 1, true) then
+    for tty in pairs(ttyWin) do
+      if script:find(tty, 1, true) then
+        selectLog[#selectLog + 1] = tty
+        return true, true
+      end
+    end
+    return true, false
+  end
+  -- selectedTabs query
+  if script:find("if selected of t", 1, true)
+     or script:find("current session of current tab", 1, true) then
+    if selStub then return true, selStub end
+    local all = {}
+    for tty in pairs(ttyWin) do all[#all + 1] = tty end
+    return true, all
+  end
+  -- locate
   for tty, w in pairs(ttyWin) do
     if script:find(tty, 1, true) then
       local f = w.frame()
@@ -66,6 +88,7 @@ end
 local ok, err = pcall(function()
   local dev = dofile(os.getenv("HOME") .. "/.hammerspoon/Spoons/ClaudeBorder.spoon/init.lua")
   dev.menubar = false      -- keep the test run out of the real menubar
+  dev.tabCacheTTL = 0      -- selected-tab answers must not be cached mid-test
   local W = dev.width      -- 5
   local R = dev.radius     -- 11
 
@@ -160,6 +183,21 @@ local ok, err = pcall(function()
   check("focusNextWaiting with none waiting",
         dev:focusNextWaiting() == "none waiting" and alerted, tostring(alerted))
   hs.alert.show = realAlert
+
+  -- Background tab: a session whose tab is not its window's selected one
+  -- hides its border; it returns the moment the tab is selected again.
+  selStub = { "/dev/ttyTEST_A", "/dev/ttyTEST_C" }
+  dev:restack()
+  check("background-tab border hides", not cB:isShowing(), tostring(cB:isShowing()))
+  check("selected-tab border stays", cA:isShowing(), tostring(cA:isShowing()))
+  selStub = nil
+  dev:restack()
+  check("border returns when tab reselected", cB:isShowing(), tostring(cB:isShowing()))
+
+  -- focus() selects the tty's tab before focusing the window.
+  selectLog = {}
+  dev:focus("/dev/ttyTEST_B")
+  check("focus selects the tab", selectLog[1] == "/dev/ttyTEST_B", hs.inspect(selectLog))
 
   -- prune() clears ttys with no live claude; a failed ps clears nothing.
   hs.execute = function() return "" end
