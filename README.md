@@ -11,6 +11,11 @@ Borders are **occlusion-aware**: the parts covered by other windows are punched
 out, so a border reads as glued to its window instead of floating over the
 window stack.
 
+![Two overlapping Claude sessions: the covered blue border is punched out under the red window; the red border blinks until its window is focused](docs/demo.gif)
+
+*(Illustration drawn with the same canvas primitives the Spoon uses — not a
+screen recording.)*
+
 ## Why not just `/color`?
 
 `/color` tints Claude Code's own UI *inside* the pane. It tells you nothing when
@@ -20,9 +25,9 @@ puts the same colour on the window itself.
 ## Requirements
 
 - macOS 14+
-- **Terminal.app** (fully supported) or **iTerm2** (implemented per its
-  scripting dictionary; less battle-tested). Ghostty, kitty and WezTerm expose
-  no AppleScript and are not supportable — the tty→window lookup needs it.
+- **Terminal.app** (fully supported) or **iTerm2** (see disclosure below).
+  Ghostty, kitty and WezTerm expose no AppleScript and are not supportable —
+  the tty→window lookup needs it.
 - [Hammerspoon](https://www.hammerspoon.org) — `brew install --cask hammerspoon`
 - Claude Code
 
@@ -157,6 +162,16 @@ disabled. `spoon.ClaudeBorder:setEnabled(false)` does the same from the CLI.
 blink; pressing it repeatedly walks through every waiting session. Configure
 with `focusHotkey`, disable with `cb.focusHotkey = false`.
 
+### Floating pill
+
+The MacBook notch swallows overflowing menu-bar items with no indication — and
+newly created status items are inserted at the left end of the status area,
+exactly the region that hides first. `cb.pill = true` adds a notch-proof
+fallback: a small floating capsule (one dot per waiting session, same colours)
+on the primary screen, `pillCorner` picks which corner ("topRight" default).
+It exists only while something waits, and clicking it focuses the next waiting
+session. Off by default.
+
 ### Pruning
 
 `SessionEnd` only fires on a clean exit. Every `pruneInterval` (10s) the Spoon
@@ -175,6 +190,16 @@ restart therefore no longer leaves existing windows bare.
 The unlock rescan matters more than it looks: a **locked screen degrades the
 macOS Accessibility API system-wide** (windows enumerate but report no frames),
 so any border work attempted while locked fails. Everything heals on unlock.
+
+## iTerm2 disclosure
+
+The iTerm2 support is written against iTerm2's AppleScript dictionary
+(windows → tabs → sessions, `tty of session`, `select`) but has **never been
+exercised against a real iTerm2** — this machine runs Terminal.app. Treat it
+as experimental: the resolver is tried only when iTerm2 is actually running,
+so it cannot break Terminal.app users, but iTerm2 users should expect rough
+edges (split panes follow the *active* pane; window `bounds` coordinates are
+assumed to match the Accessibility frame). Issues and fixes welcome.
 
 ## Known limitations
 
@@ -208,7 +233,9 @@ cb.zPollInterval = 2.0      -- safety-net restack, seconds; 0 disables
 cb.menubar       = true     -- menubar item: waiting dots + Enable/Disable toggle
 cb.focusHotkey   = { {"ctrl","alt","cmd"}, "b" }  -- focus next waiting; false disables
 cb.pruneInterval = 10       -- clear borders of dead sessions, seconds; 0 disables
-cb.tabCacheTTL   = 0.3      -- seconds the selected-tab answer is cached
+cb.tabCacheTTL   = 1.0      -- min seconds between selected-tab refreshes
+cb.pill          = false    -- floating waiting pill (notch-proof menubar fallback)
+cb.pillCorner    = "topRight"
 cb.colors.green  = "#32d74b"
 cb:start()
 ```
@@ -247,7 +274,7 @@ open -g "hammerspoon://border?tty=/dev/ttys001&color=off"
 ./test/run.sh
 ```
 
-Runs a headless suite (45 checks) against the **installed** spoon inside the
+Runs a headless suite (48 checks) against the **installed** spoon inside the
 live Hammerspoon: the AX/AppleScript layer is stubbed with fake windows, so
 occlusion punching, visibility, z-ordering, blink and the in-place repaint are
 verified numerically — it even works with the screen locked.

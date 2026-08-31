@@ -14,7 +14,7 @@ local obj = {}
 obj.__index = obj
 
 obj.name     = "ClaudeBorder"
-obj.version  = "2.4"
+obj.version  = "2.5"
 obj.author   = "Nikolaj Søgaard Simonsen"
 obj.homepage = "https://github.com/NikolajMosbaek/claude-terminal-borders"
 obj.license  = "MIT - https://opensource.org/licenses/MIT"
@@ -73,6 +73,19 @@ obj.menubar = true
 --- hs.settings key that persists the Enable/Disable toggle across Hammerspoon
 --- restarts.
 obj.settingsKey = "ClaudeBorder.enabled"
+
+--- ClaudeBorder.pill (Boolean)
+--- Floating "waiting" pill: a small capsule with one dot per waiting session,
+--- drawn as a canvas on the primary screen. It exists for menu bars the
+--- MacBook notch eats -- macOS hides overflowing status items with no
+--- indication, so the menubar dots can be invisible exactly when needed.
+--- Clicking the pill focuses the next waiting session. Off by default.
+obj.pill = false
+
+--- ClaudeBorder.pillCorner (String)
+--- Where the pill sits on the primary screen: "topRight" (default),
+--- "topLeft", "bottomRight" or "bottomLeft".
+obj.pillCorner = "topRight"
 
 --- ClaudeBorder.focusHotkey (Table | false)
 --- Hotkey that focuses the next waiting session (and thereby clears its
@@ -494,7 +507,58 @@ local function liveTitle(rec)
   return (ok and t and #t > 0 and t) or rec.title or "?"
 end
 
+-- The floating pill: a notch-proof stand-in for the menubar dots. Lives on
+-- the primary screen, repositioned on every update so display changes are
+-- absorbed; clicking it focuses the next waiting session.
+local pillCanvas
+local function updatePill()
+  local waiting = (obj.pill and enabled) and waitingRecs() or {}
+  if #waiting == 0 then
+    if pillCanvas then pillCanvas:delete(); pillCanvas = nil; obj._pill = nil end
+    return
+  end
+  local h, r, gap, margin = 22, 4.5, 13, 14
+  local w = 9 + #waiting * gap
+  local sf = hs.screen.primaryScreen():fullFrame()
+  local corner = obj.pillCorner or "topRight"
+  local x = corner:find("Left") and (sf.x + margin) or (sf.x + sf.w - w - margin)
+  local y = corner:find("top", 1, true) and (sf.y + 38) or (sf.y + sf.h - h - margin)
+  if not pillCanvas then
+    pillCanvas = hs.canvas.new({ x = x, y = y, w = w, h = h })
+    obj._pill = pillCanvas
+    pillCanvas:level(hs.canvas.windowLevels.floating)
+    pillCanvas:behavior(hs.canvas.windowBehaviors.canJoinAllSpaces)
+    pillCanvas:clickActivating(false)
+    pillCanvas:canvasMouseEvents(true, false, false, false)
+    pillCanvas:mouseCallback(function(_, event)
+      if event == "mouseDown" then obj:focusNextWaiting() end
+    end)
+  else
+    pillCanvas:frame({ x = x, y = y, w = w, h = h })
+  end
+  while #pillCanvas > 0 do pillCanvas:removeElement(#pillCanvas) end
+  pillCanvas:appendElements({
+    type             = "rectangle",
+    action           = "strokeAndFill",
+    fillColor        = { hex = "#1c1c1e", alpha = 0.92 },
+    strokeColor      = { hex = "#ffffff", alpha = 0.16 },
+    strokeWidth      = 1,
+    roundedRectRadii = { xRadius = h / 2, yRadius = h / 2 },
+  })
+  for i, e in ipairs(waiting) do
+    pillCanvas:appendElements({
+      type      = "circle",
+      action    = "fill",
+      fillColor = { hex = e.rec.color or "#8e8e93", alpha = 1.0 },
+      center    = { x = w / 2 + (i - (#waiting + 1) / 2) * gap, y = h / 2 },
+      radius    = r,
+    })
+  end
+  pillCanvas:show()
+end
+
 local function updateMenubar()
+  updatePill()   -- same triggers, same waiting set
   if not obj.menubar then
     if bar then bar:delete(); bar = nil; obj._bar = nil end
     return
@@ -1150,6 +1214,7 @@ function obj:stop()
   if pruneTimer then pruneTimer:stop(); pruneTimer = nil; obj._pruneTimer = nil end
   if hotkeyObj then hotkeyObj:delete(); hotkeyObj = nil; obj._hotkey = nil end
   if bar then bar:delete(); bar = nil end
+  if pillCanvas then pillCanvas:delete(); pillCanvas = nil; obj._pill = nil end
   if blinkTimer then blinkTimer:stop(); blinkTimer = nil end
   if restackDelayed then restackDelayed:stop() end
   cancelPending()

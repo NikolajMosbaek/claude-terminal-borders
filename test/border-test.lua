@@ -224,6 +224,20 @@ local ok, err = pcall(function()
   check("enable restores borders", cA:isShowing() and cB:isShowing(),
         tostring(cA:isShowing()) .. "/" .. tostring(cB:isShowing()))
 
+  -- Floating waiting pill: appears while something waits, dies when nothing
+  -- does, and clicking-equivalent focusNextWaiting still works through it.
+  dev.pill = true
+  local beforePill = #madeCanvases
+  dev:mode("/dev/ttyTEST_B", "blink")
+  local pillC = madeCanvases[#madeCanvases]
+  check("pill appears when waiting",
+        #madeCanvases == beforePill + 1 and pillC:isShowing(), tostring(#madeCanvases - beforePill))
+  check("pill carries one dot", #pillC == 2, #pillC)   -- capsule + 1 dot
+  dev:mode("/dev/ttyTEST_B", "solid")
+  local okPill, showingPill = pcall(function() return pillC:isShowing() end)
+  check("pill goes when nothing waits", (not okPill) or (not showingPill), tostring(showingPill))
+  dev.pill = false
+
   -- prune() clears ttys with no live claude; a failed ps clears nothing.
   psStub = ""
   dev:prune()
